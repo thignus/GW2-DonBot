@@ -16,6 +16,7 @@ public static class AuthEndpoints
         app.MapGet("/auth/discord/callback", HandleDiscordCallback);
         app.MapPost("/auth/logout", HandleLogout);
         app.MapGet("/auth/me", HandleMe).RequireAuthorization();
+        app.MapGet("/auth/refresh", HandleRefresh).RequireAuthorization();
     }
 
     private static IResult HandleDiscordLogin(
@@ -155,5 +156,48 @@ public static class AuthEndpoints
             ?? [];
         var showCookieBanner = bannerIds.Contains(discordId);
         return Results.Ok(new { discordId, username, showCookieBanner });
+    }
+
+    private static IResult HandleRefresh(ClaimsPrincipal user, HttpContext httpContext, IConfiguration configuration, IHostEnvironment env)
+    {
+        // Force old JWTs without the Discord guilds scope through login again.
+        if (string.IsNullOrEmpty(user.FindFirst("discord_access_token")?.Value))
+        {
+            httpContext.Response.Cookies.Delete("donbot_token", new CookieOptions
+            {
+                Domain = configuration["CookieDomain"] is { Length: > 0 } dd ? dd : null,
+                Path = "/"
+            });
+            return Results.Unauthorized();
+        }
+
+        var discordId = user.FindFirst("discord_id")?.Value ?? "";
+        var username = user.FindFirst("username")?.Value ?? "";
+        var discord_access_token = user.FindFirst("discord_access_token")?.Value ?? "";
+
+        var jwtKey = configuration["DonBotJwtKey"] ?? Environment.GetEnvironmentVariable("DonBotJwtKey")
+            ?? throw new InvalidOperationException("'DonBotJwtKey' is not configured. Set it in appsettings.user.json or the .env file.");
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey));
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+        var jwtToken = new JwtSecurityToken(
+            claims: [
+                new Claim("discord_id", discordId),
+                new Claim("username", username),
+                new Claim("discord_access_token", discord_access_token)
+            ],
+            expires: DateTime.UtcNow.AddDays(14),
+            signingCredentials: credentials);
+        var tokenString = new JwtSecurityTokenHandler().WriteToken(jwtToken);
+
+        httpContext.Response.Cookies.Append("donbot_token", tokenString, new CookieOptions
+        {
+            HttpOnly = true,
+            SameSite = SameSiteMode.Lax,
+            Secure = env.IsProduction(),
+            Domain = configuration["CookieDomain"] is { Length: > 0 } d ? d : null,
+            Expires = DateTimeOffset.UtcNow.AddDays(14)
+        });
+
+        return Results.Ok(tokenString);
     }
 }

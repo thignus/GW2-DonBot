@@ -81,7 +81,7 @@ internal static class SignupMessageBuilder
             return $"{GetDefaultResponseText(fieldName)}\n\n**Total: 0**";
         }
 
-        return string.Join('\n', users) + $"\n\n**Total: {users.Count}**";
+        return string.Join('\n', users) + $"\n**Total: {users.Count}**\n\uFEFF";
     }
 
     private static string GetDefaultResponseText(string fieldName) => fieldName switch
@@ -110,7 +110,8 @@ internal static class SignupMessageBuilder
             .Split('\n')
             .Where(line => !string.IsNullOrWhiteSpace(line) &&
                            !line.StartsWith("**Total:") &&
-                           !GetDefaultResponseText(field.Name).Equals(line))
+                           !GetDefaultResponseText(field.Name).Equals(line) &&
+                           !line.Contains("\uFEFF"))
             .ToList();
     }
 
