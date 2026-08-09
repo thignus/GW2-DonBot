@@ -551,8 +551,8 @@ public class DiscordButtonHandler(
 
     private static bool HasMentionPrefix(string line, string mention) =>
         line.Equals(mention, StringComparison.Ordinal)
-        || line.StartsWith($"{mention} ", StringComparison.Ordinal)
-        || line.StartsWith($"{mention}(", StringComparison.Ordinal);
+        || line.StartsWith($"└{mention} ", StringComparison.Ordinal)
+        || line.StartsWith($"└{mention}(", StringComparison.Ordinal);
 
     private static async Task TryFollowupAsync(SocketMessageComponent buttonComponent, string message)
     {
