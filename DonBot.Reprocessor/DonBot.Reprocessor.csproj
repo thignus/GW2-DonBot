@@ -18,10 +18,10 @@
 
   <ItemGroup>
     <Content Include="..\GW2-DonBot\appsettings.json" Link="appsettings.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </Content>
     <Content Include="..\GW2-DonBot\appsettings.user.json" Link="appsettings.user.json" Condition="Exists('..\GW2-DonBot\appsettings.user.json')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 

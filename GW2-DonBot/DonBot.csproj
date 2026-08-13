@@ -17,7 +17,7 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="appsettings.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </Content>
     <Content Include="appsettings.user.json" Condition="Exists('appsettings.user.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

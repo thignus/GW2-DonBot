@@ -22,5 +22,10 @@
     <PackageReference Include="Serilog.AspNetCore" />
     <PackageReference Include="tusdotnet" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Update="appsettings.json">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 
 </Project>

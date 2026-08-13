@@ -528,7 +528,7 @@ public class DiscordButtonHandler(
 
         return string.IsNullOrWhiteSpace(cleanUsername)
             ? mention
-            : $"{mention} ({cleanUsername})";
+            : $"└{mention} ({cleanUsername})";
     }
 
     private static string FormatUserLine(IUser user) =>

@@ -58,7 +58,6 @@ public enum FightTypesEnum
     Spirit = 53, // wing 1
     Shadow = 54, // Fractal
     Kela = 55, // wing 9
-    Golem2 = 32766, // Golem
-    Golem = 32767, // Golem
-    Unkn = -1,
+    Golem = 32766, // Golem
+    Unkn = short.MaxValue,
 }
