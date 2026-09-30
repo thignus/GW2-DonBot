@@ -25,6 +25,7 @@ public static class ServiceRegister
         services.AddTransient<IWvWFightSummaryService, WvWFightSummaryService>();
         services.AddTransient<IRaidReportService, RaidReportService>();
         services.AddTransient<IWeeklyLeaderboardService, WeeklyLeaderboardService>();
+        services.AddTransient<IPlayerPointRankingService, PlayerPointRankingService>();
         services.AddTransient<IMessageGenerationService, MessageGenerationService>();
 
         services.AddScoped<ISecretService, SecretServices>();
@@ -34,11 +35,13 @@ public static class ServiceRegister
         services.AddScoped<DiscordCommandHandler>();
         services.AddScoped<DiscordButtonHandler>();
         services.AddScoped<DiscordMessageHandler>();
+        services.AddScoped<PlayerPointRankingPublisher>();
         services.AddScoped<ILoggingService, LoggingService>();
         services.AddSingleton<IArtSpamDetector, ArtSpamDetector>();
         services.AddSingleton<IScheduledMessageDeleteClient, DiscordScheduledMessageDeleteClient>();
         services.AddSingleton<ScheduledMessageDeleteService>();
-        services.AddSingleton<IScheduledMessageDeleteScheduler>(sp => sp.GetRequiredService<ScheduledMessageDeleteService>());
+        services.AddSingleton<IScheduledMessageDeleteScheduler>(sp =>
+            sp.GetRequiredService<ScheduledMessageDeleteService>());
         services.AddScoped<IPlayerService, PlayerService>();
         services.AddScoped<IPointsAwardService, PointsAwardService>();
         services.AddScoped<IRaidCommandService, RaidCommandCommandService>();
@@ -51,6 +54,7 @@ public static class ServiceRegister
         services.AddSingleton<RaffleService>();
 
         services.AddSingleton<IPendingLogService, PendingLogService>();
+        services.AddScoped<DiscordReportDeliveryClaimService>();
 
         services.AddTransient<IGenericCommandsService, GenericCommandsService>();
         services.AddTransient<IVerifyCommandsService, VerifyCommandsService>();

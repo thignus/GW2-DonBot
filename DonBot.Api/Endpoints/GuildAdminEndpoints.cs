@@ -35,6 +35,8 @@ public static class GuildAdminEndpoints
         string? LogReportChannelId,
         string? AdvanceLogReportChannelId,
         string? StreamLogChannelId,
+        bool MannyUploaderDiscordDeliveryEnabled,
+        bool MannyUploaderChannelOverrideEnabled,
         bool RaidAlertEnabled,
         string? RaidAlertChannelId,
         bool RemoveSpamEnabled,
@@ -43,6 +45,8 @@ public static class GuildAdminEndpoints
         bool AutoSubmitToWingman,
         bool AutoAggregateLogs,
         bool AutoReplySingleLog,
+        bool PlayerPointRankingsEnabled,
+        string? PlayerPointRankingsChannelId,
         bool WvwLeaderboardEnabled,
         string? WvwLeaderboardChannelId,
         bool PveLeaderboardEnabled,
@@ -210,6 +214,7 @@ public static class GuildAdminEndpoints
             ?? ValidateOptionalSnowflake(dto.StreamLogChannelId, validChannelIds, nameof(dto.StreamLogChannelId))
             ?? ValidateOptionalSnowflake(dto.RaidAlertChannelId, validChannelIds, nameof(dto.RaidAlertChannelId))
             ?? ValidateOptionalSnowflake(dto.RemovedMessageChannelId, validChannelIds, nameof(dto.RemovedMessageChannelId))
+            ?? ValidateOptionalSnowflake(dto.PlayerPointRankingsChannelId, validChannelIds, nameof(dto.PlayerPointRankingsChannelId))
             ?? ValidateOptionalSnowflake(dto.WvwLeaderboardChannelId, validChannelIds, nameof(dto.WvwLeaderboardChannelId))
             ?? ValidateOptionalSnowflake(dto.PveLeaderboardChannelId, validChannelIds, nameof(dto.PveLeaderboardChannelId));
 
@@ -444,6 +449,8 @@ public static class GuildAdminEndpoints
         LongToString(g.LogReportChannelId),
         LongToString(g.AdvanceLogReportChannelId),
         LongToString(g.StreamLogChannelId),
+        g.MannyUploaderDiscordDeliveryEnabled,
+        g.MannyUploaderChannelOverrideEnabled,
         g.RaidAlertEnabled,
         LongToString(g.RaidAlertChannelId),
         g.RemoveSpamEnabled,
@@ -452,6 +459,8 @@ public static class GuildAdminEndpoints
         g.AutoSubmitToWingman,
         g.AutoAggregateLogs,
         g.AutoReplySingleLog,
+        g.PlayerPointRankingsEnabled,
+        LongToString(g.PlayerPointRankingsChannelId),
         g.WvwLeaderboardEnabled,
         LongToString(g.WvwLeaderboardChannelId),
         g.PveLeaderboardEnabled,
@@ -478,6 +487,8 @@ public static class GuildAdminEndpoints
         guild.LogReportChannelId = ParseOptionalLong(dto.LogReportChannelId);
         guild.AdvanceLogReportChannelId = ParseOptionalLong(dto.AdvanceLogReportChannelId);
         guild.StreamLogChannelId = ParseOptionalLong(dto.StreamLogChannelId);
+        guild.MannyUploaderDiscordDeliveryEnabled = dto.MannyUploaderDiscordDeliveryEnabled;
+        guild.MannyUploaderChannelOverrideEnabled = dto.MannyUploaderChannelOverrideEnabled;
         guild.RaidAlertEnabled = dto.RaidAlertEnabled;
         guild.RaidAlertChannelId = ParseOptionalLong(dto.RaidAlertChannelId);
         guild.RemoveSpamEnabled = dto.RemoveSpamEnabled;
@@ -486,6 +497,8 @@ public static class GuildAdminEndpoints
         guild.AutoSubmitToWingman = dto.AutoSubmitToWingman;
         guild.AutoAggregateLogs = dto.AutoAggregateLogs;
         guild.AutoReplySingleLog = dto.AutoReplySingleLog;
+        guild.PlayerPointRankingsEnabled = dto.PlayerPointRankingsEnabled;
+        guild.PlayerPointRankingsChannelId = ParseOptionalLong(dto.PlayerPointRankingsChannelId);
         guild.WvwLeaderboardEnabled = dto.WvwLeaderboardEnabled;
         guild.WvwLeaderboardChannelId = ParseOptionalLong(dto.WvwLeaderboardChannelId);
         guild.PveLeaderboardEnabled = dto.PveLeaderboardEnabled;

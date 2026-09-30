@@ -17,7 +17,7 @@ namespace DonBot.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "10.0.5")
+                .HasAnnotation("ProductVersion", "10.0.11")
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
@@ -48,6 +48,38 @@ namespace DonBot.Migrations
                     b.HasKey("DiscordId");
 
                     b.ToTable("Account");
+                });
+
+            modelBuilder.Entity("DonBot.Core.Models.Entities.DiscordReportDeliveryClaim", b =>
+                {
+                    b.Property<long>("DiscordReportDeliveryClaimId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("DiscordReportDeliveryClaimId"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("GuildId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("ReportUrlHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.HasKey("DiscordReportDeliveryClaimId");
+
+                    b.HasIndex("GuildId", "ReportUrlHash")
+                        .IsUnique();
+
+                    b.ToTable("DiscordReportDeliveryClaim");
                 });
 
             modelBuilder.Entity("DonBot.Core.Models.Entities.FightLog", b =>
@@ -198,6 +230,18 @@ namespace DonBot.Migrations
                     b.Property<long?>("LogReportChannelId")
                         .HasColumnType("bigint");
 
+                    b.Property<bool>("MannyUploaderChannelOverrideEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool>("MannyUploaderDiscordDeliveryEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<long?>("PlayerPointRankingsChannelId")
+                        .HasColumnType("bigint");
+
+                    b.Property<bool>("PlayerPointRankingsEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<long?>("PveLeaderboardChannelId")
                         .HasColumnType("bigint");
 
@@ -295,12 +339,19 @@ namespace DonBot.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<long?>("DiscordDeliveryChannelId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("DiscordDeliveryMode")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
                     b.Property<long>("DiscordId")
                         .HasColumnType("bigint");
 
                     b.Property<string>("DpsReportUrl")
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
 
                     b.Property<string>("ErrorMessage")
                         .HasMaxLength(2000)
@@ -311,8 +362,8 @@ namespace DonBot.Migrations
 
                     b.Property<string>("FileName")
                         .IsRequired()
-                        .HasMaxLength(500)
-                        .HasColumnType("character varying(500)");
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
 
                     b.Property<long>("GuildId")
                         .HasColumnType("bigint");
@@ -342,7 +393,56 @@ namespace DonBot.Migrations
                     b.HasIndex("TusFileId")
                         .IsUnique();
 
+                    b.HasIndex("DiscordId", "GuildId", "DpsReportUrl")
+                        .IsUnique()
+                        .HasFilter("\"SourceType\" = 'url' AND \"GuildId\" > 0 AND \"DpsReportUrl\" IS NOT NULL");
+
                     b.ToTable("LogUpload");
+                });
+
+            modelBuilder.Entity("DonBot.Core.Models.Entities.LogUploadDiscordDeliveryReceipt", b =>
+                {
+                    b.Property<long>("LogUploadDiscordDeliveryReceiptId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("LogUploadDiscordDeliveryReceiptId"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long?>("DiscordMessageId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("FailureCode")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("LogUploadId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("MessageKind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long?>("ResolvedChannelId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("LogUploadDiscordDeliveryReceiptId");
+
+                    b.HasIndex("LogUploadId", "MessageKind")
+                        .IsUnique();
+
+                    b.ToTable("LogUploadDiscordDeliveryReceipt");
                 });
 
             modelBuilder.Entity("DonBot.Core.Models.Entities.PlayerFightLog", b =>
@@ -444,6 +544,10 @@ namespace DonBot.Migrations
                         .HasColumnType("numeric(6,2)");
 
                     b.Property<decimal>("QuicknessGenGroup")
+                        .HasPrecision(6, 2)
+                        .HasColumnType("numeric(6,2)");
+
+                    b.Property<decimal>("RegenDuration")
                         .HasPrecision(6, 2)
                         .HasColumnType("numeric(6,2)");
 
@@ -786,6 +890,15 @@ namespace DonBot.Migrations
                     b.HasOne("DonBot.Core.Models.Entities.FightLog", null)
                         .WithOne()
                         .HasForeignKey("DonBot.Core.Models.Entities.FightLogRawData", "FightLogId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("DonBot.Core.Models.Entities.LogUploadDiscordDeliveryReceipt", b =>
+                {
+                    b.HasOne("DonBot.Core.Models.Entities.LogUpload", null)
+                        .WithMany()
+                        .HasForeignKey("LogUploadId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

@@ -9,13 +9,13 @@ public class LogUpload
 
     public long DiscordId { get; set; }
 
-    [MaxLength(500)]
+    [MaxLength(2048)]
     public string FileName { get; set; } = string.Empty;
 
     [MaxLength(50)]
     public string Status { get; set; } = "pending";
 
-    [MaxLength(2000)]
+    [MaxLength(2048)]
     public string? DpsReportUrl { get; set; }
 
     public long? FightLogId { get; set; }
@@ -32,6 +32,11 @@ public class LogUpload
     public bool SubmitToWingman { get; set; } = true;
 
     public long GuildId { get; set; }
+
+    [MaxLength(32)]
+    public string? DiscordDeliveryMode { get; set; }
+
+    public long? DiscordDeliveryChannelId { get; set; }
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 

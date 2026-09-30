@@ -4,6 +4,7 @@ using Discord.WebSocket;
 using DonBot.Core.Models.Entities;
 using DonBot.Core.Models.Enums;
 using DonBot.Core.Models.GuildWars2;
+using DonBot.Extensions;
 using DonBot.Services.DatabaseServices;
 using DonBot.Services.GuildWarsServices.MessageGeneration;
 using DonBot.Tests.Infrastructure;
@@ -14,6 +15,40 @@ namespace DonBot.Tests.Services.GuildWarsServices.MessageGeneration;
 public class RaidReportFooterTests
 {
     private const long GuildId = 1;
+
+    [Fact]
+    public async Task Generate_WvWSubOverview_ShowsAverageRegenInsteadOfAlac()
+    {
+        var report = MakeReport();
+        var fights = MakeFights(FightTypesEnum.WvW, 2, report);
+        var playerFights = fights.Select((fight, index) => new PlayerFightLog
+        {
+            FightLogId = fight.FightLogId,
+            GuildWarsAccountName = "Player.1234",
+            SubGroup = 1,
+            RegenDuration = index == 0 ? 80m : 0m,
+            AlacDuration = 99m,
+            QuicknessDuration = 75m
+        }).ToList();
+        var service = BuildService(new SequenceFooterService(), fights, playerFights);
+
+        var (embeds, _) = await service.Generate(report, GuildId);
+
+        Assert.NotNull(embeds);
+        var embed = embeds[0];
+        Assert.Equal("Report (WvW)\n", embed.Title);
+        Assert.StartsWith("**Length:**", embed.Description);
+        Assert.NotNull(embed.Footer?.Text);
+        Assert.Equal(new[] { "Raid Overview", "Sub Overview" }, embed.Fields.Select(f => f.Name));
+        var table = embed.Fields.Single(f => f.Name == "Sub Overview").Value;
+        Assert.Contains("Regen", table);
+        Assert.DoesNotContain("Alac", table);
+        Assert.Contains(DiscordTable.Row(RaidReportService.WvWSubColumns, "1", "75", "40", "0"), table);
+        foreach (var row in table.Replace("```", "").Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            Assert.True(row.Length <= DiscordTable.MaxRowWidth, row);
+        }
+    }
 
     [Fact]
     public async Task Generate_PvEPath_TopAggregateEmbedsHaveDistinctFooters()
@@ -148,6 +183,9 @@ internal sealed class SequenceFooterService : IFooterService
 internal sealed class FakeWvWSummaryService(IFooterService footerService) : IWvWFightSummaryService
 {
     public Task<(Embed Embed, string? WebAppUrl, long? FightLogId)> Generate(EliteInsightDataModel data, bool advancedLog, Guild guild, DiscordSocketClient client)
+        => throw new NotImplementedException();
+
+    public Task<WvWFightSummaryRenderResult> Render(EliteInsightDataModel data, bool advancedLog, Guild guild, FightLog? fightLog)
         => throw new NotImplementedException();
 
     public async Task<Embed> GenerateMessage(bool advancedLog, int playerCount, List<Gw2Player> gw2Players, EmbedBuilder message, long guildId, StatTotals? statTotals = null)
