@@ -338,7 +338,7 @@ public class DiscordMessageHandler(
                 var cb = new ComponentBuilder().WithButton("Know My Enemy", ButtonId.KnowMyEnemy);
                 if (wvwWebAppUrl != null)
                 {
-                    cb.WithButton("View on DonBot", style: ButtonStyle.Link, url: wvwWebAppUrl);
+                    cb.WithButton("View full aggregate on DonBot", style: ButtonStyle.Link, url: wvwWebAppUrl);
                 }
                 buttonBuilder = cb.Build();
             }
@@ -347,7 +347,7 @@ public class DiscordMessageHandler(
                 var (pveMessage, pveWebAppUrl, _) = await messageGenerationService.GeneratePvEFightSummary(eliteInsightDataModel, guildId);
                 message = pveMessage;
                 buttonBuilder = pveWebAppUrl != null
-                    ? new ComponentBuilder().WithButton("View on DonBot", style: ButtonStyle.Link, url: pveWebAppUrl).Build()
+                    ? new ComponentBuilder().WithButton("View full aggregate on DonBot", style: ButtonStyle.Link, url: pveWebAppUrl).Build()
                     : null;
             }
 
@@ -457,7 +457,7 @@ public class DiscordMessageHandler(
                     var hasButton = false;
                     if (i == messages.Count - 1 && replyWebAppUrl != null)
                     {
-                        cb.WithButton("View on DonBot", style: ButtonStyle.Link, url: replyWebAppUrl);
+                        cb.WithButton("View full aggregate on DonBot", style: ButtonStyle.Link, url: replyWebAppUrl);
                         hasButton = true;
                     }
                     if (i == bestTimesIndex && bestTimesButtonId != null)
@@ -481,7 +481,7 @@ public class DiscordMessageHandler(
                 var cb = new ComponentBuilder().WithButton("Know My Enemy", ButtonId.KnowMyEnemy);
                 if (wvwUrl != null)
                 {
-                    cb.WithButton("View on DonBot", style: ButtonStyle.Link, url: wvwUrl);
+                    cb.WithButton("View full aggregate on DonBot", style: ButtonStyle.Link, url: wvwUrl);
                 }
                 singleButtonBuilder = cb.Build();
             }
@@ -491,7 +491,7 @@ public class DiscordMessageHandler(
                 singleMessage = pveMsg;
                 if (pveUrl != null)
                 {
-                    singleButtonBuilder = new ComponentBuilder().WithButton("View on DonBot", style: ButtonStyle.Link, url: pveUrl).Build();
+                    singleButtonBuilder = new ComponentBuilder().WithButton("View full aggregate on DonBot", style: ButtonStyle.Link, url: pveUrl).Build();
                 }
             }
 

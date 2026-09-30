@@ -502,6 +502,8 @@ public sealed class RaidReportService(
             }
         };
 
+        var aggregateUrl = "https://donbot.thignus.com/logs/aggregate?ids=";
+
         for (var i = 0; i < fightLogs.Count; i += 12)
         {
             var currentBatch = fightLogs.GetRange(i, Math.Min(12, fightLogs.Count - i));
@@ -510,8 +512,17 @@ public sealed class RaidReportService(
             foreach (var item in currentBatch)
             {
                 var failedPercentageString = !isSuccessLogs ? $"{(item.FightPhase != null ? ($" - P{item.FightPhase}") : string.Empty)} - {item.FightPercent}%" : string.Empty;
-                fightUrlOverview += $"{Enum.GetName(typeof(FightTypesEnum), item.FightType)} - {item.FightMode.GetFightModeName()}{failedPercentageString} - {item.Url}\n";
+
+                string donbotUrl = "https://donbot.thignus.com/logs/" + item.FightLogId;
+
+                fightUrlOverview += $"{Enum.GetName(typeof(FightTypesEnum), item.FightType)} - {item.FightMode.GetFightModeName()}{failedPercentageString} - {donbotUrl}\n";
+
+                aggregateUrl += item.FightLogId + ",";
             }
+            aggregateUrl = aggregateUrl.Substring(0, aggregateUrl.Length - 1);
+
+            if (i+12 >= fightLogs.Count)
+                fightUrlOverview += $"\n{(isSuccessLogs ? "Success" : "Failed")} Aggregate Url - {aggregateUrl}\n";
 
             message.AddField(x =>
             {

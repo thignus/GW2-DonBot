@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Security.Claims;
 using System.Text;
 using DonBot.Api.Services;
@@ -6,7 +7,10 @@ using DonBot.Core.Models.Entities;
 using DonBot.Core.Services.GuildWars2;
 using DonBot.Models.Apis.GuildWars2Api;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Internal;
+using Microsoft.Extensions.Caching.Memory;
 using Newtonsoft.Json;
+using Superpower.Model;
 using tusdotnet;
 using tusdotnet.Interfaces;
 using tusdotnet.Models;
@@ -19,6 +23,7 @@ public static class UploadEndpoints
 {
     private const string Gw2ApiKeyHeader = "X-GW2-API-Key";
     private const string TusUploadIdentityItemKey = "donbot:tus-upload-identity";
+    private static readonly TimeSpan Gw2GuildMemberIdsCacheTtl = TimeSpan.FromHours(24);
 
     public static void MapUploadEndpoints(this WebApplication app)
     {
@@ -48,6 +53,9 @@ public static class UploadEndpoints
                 OnAuthorizeAsync = AuthorizeTusRequestAsync,
                 OnBeforeCreateAsync = async ctx =>
                 {
+                    var logger = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<WebApplication>>();
+                    var cache = ctx.HttpContext.RequestServices.GetRequiredService<IMemoryCache>();
+
                     if (!TryGetMetadataString(ctx.Metadata, "filename", out var filename) ||
                         !filename.EndsWith(".zevtc", StringComparison.OrdinalIgnoreCase))
                     {
@@ -55,7 +63,7 @@ public static class UploadEndpoints
                         return;
                     }
 
-                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
+                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken, logger, cache);
 
                     if (guildResult.FailureStatus is { } status)
                     {
@@ -64,7 +72,10 @@ public static class UploadEndpoints
                 },
                 OnCreateCompleteAsync = async ctx =>
                 {
-                    var identityResult = await ResolveTusUploadIdentityAsync(ctx.HttpContext, ctx.CancellationToken);
+                    var logger = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<WebApplication>>();
+                    var cache = ctx.HttpContext.RequestServices.GetRequiredService<IMemoryCache>();
+
+                    var identityResult = await ResolveTusUploadIdentityAsync(ctx.HttpContext, ctx.CancellationToken, logger, cache);
                     if (identityResult.Identity is not { } identity)
                     {
                         return;
@@ -77,7 +88,7 @@ public static class UploadEndpoints
                     var wingman = TryGetMetadataString(ctx.Metadata, "wingman", out var wingmanRaw) &&
                         string.Equals(wingmanRaw, "true", StringComparison.OrdinalIgnoreCase);
 
-                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
+                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken, logger, cache);
 
                     if (guildResult.FailureStatus is not null)
                     {
@@ -223,9 +234,11 @@ public static class UploadEndpoints
     private static async Task<TusGuildResolution> ResolveTusGuildIdAsync(
         HttpContext httpContext,
         IReadOnlyDictionary<string, Metadata> metadata,
-        CancellationToken ct)
+        CancellationToken ct,
+        ILogger<WebApplication> logger,
+        IMemoryCache cache)
     {
-        var identityResult = await ResolveTusUploadIdentityAsync(httpContext, ct);
+        var identityResult = await ResolveTusUploadIdentityAsync(httpContext, ct, logger, cache);
         if (identityResult.Identity is not { } identity)
         {
             return TusGuildResolution.Failed(
@@ -244,7 +257,9 @@ public static class UploadEndpoints
 
     private static async Task<TusUploadIdentityResult> ResolveTusUploadIdentityAsync(
         HttpContext httpContext,
-        CancellationToken ct)
+        CancellationToken ct,
+        ILogger<WebApplication> logger,
+        IMemoryCache cache)
     {
         if (httpContext.Items.TryGetValue(TusUploadIdentityItemKey, out var cached) &&
             cached is TusUploadIdentityResult cachedResult)
@@ -264,7 +279,9 @@ public static class UploadEndpoints
                 httpContext.RequestServices.GetRequiredService<IDbContextFactory<DatabaseContext>>(),
                 httpContext.RequestServices.GetRequiredService<IHttpClientFactory>(),
                 httpContext.RequestServices.GetRequiredService<IDiscordGuildMembershipService>(),
-                ct);
+                ct,
+                logger,
+                cache);
 
             result = access.Access is { } identity
                 ? TusUploadIdentityResult.Success(new TusUploadIdentity(
@@ -303,16 +320,65 @@ public static class UploadEndpoints
         IDbContextFactory<DatabaseContext> dbContextFactory,
         IHttpClientFactory httpClientFactory,
         IDiscordGuildMembershipService guildMembershipService,
-        CancellationToken ct)
+        CancellationToken ct,
+        ILogger<WebApplication> logger,
+        IMemoryCache cache)
     {
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             return Gw2UploadAccessResult.Failed(HttpStatusCode.BadRequest, "GW2 API key is required.");
         }
 
-        var accountResult = await FetchGw2AccountAsync(apiKey.Trim(), httpClientFactory, ct);
+        // check GuildWarsAccount table for matching api key
+        //logger.LogInformation("Checking if api key is in database");
+        await using var context = await dbContextFactory.CreateDbContextAsync(ct);
+        var existingLinkedAccount = await context.GuildWarsAccount
+            .AsNoTracking()
+            .Where(a => a.GuildWarsApiKey == apiKey)
+            .Select(a => new { a.DiscordId, a.GuildWarsAccountName, a.GuildWarsGuilds })
+            .FirstOrDefaultAsync(ct);
+        if (existingLinkedAccount != null && existingLinkedAccount.GuildWarsAccountName != null)
+        {
+            //logger.LogInformation("Api key found in database, fetching guilds");
+            var existingGuilds = await ListUploadGuildsForDiscordUserAsync(
+                context,
+                existingLinkedAccount.DiscordId,
+                guildMembershipService,
+                ct,
+                logger,
+                cache);
+
+            //logger.LogInformation("Guilds fetched without needing api key");
+            return Gw2UploadAccessResult.Success(new Gw2UploadAccess(existingLinkedAccount.DiscordId, existingLinkedAccount.GuildWarsAccountName, existingGuilds));
+        }
+
+        // fall back to gw2 api incase they're using a different api key
+        //logger.LogInformation("Api key NOT found in database, checking cache first");
+        Gw2AccountResult? accountResult;
+        if (cache.TryGetValue(apiKey, out accountResult))
+        {
+            if (accountResult != null)
+            {
+                //logger.LogInformation("Found account result from cache");
+            }
+        }
+
+        if (accountResult == null)
+        {
+            //logger.LogInformation("Account result not Found in cache, fetching from gw2 api");
+            accountResult = await FetchGw2AccountAsync(apiKey.Trim(), httpClientFactory, ct);
+            if (accountResult.Access != null)
+            {
+                //logger.LogInformation("Account result found using gw2 api, saving to cache");
+                MemoryCacheEntryOptions cacheExpire = new MemoryCacheEntryOptions();
+                cacheExpire.SetSlidingExpiration(Gw2GuildMemberIdsCacheTtl);
+                cache.Set(apiKey, accountResult, cacheExpire);
+            }
+        }
         if (accountResult.Access is not { } accountData)
         {
+            //logger.LogInformation("Invalid api key, removing it from cache and returning failed");
+            cache.Remove(apiKey);
             return Gw2UploadAccessResult.Failed(
                 accountResult.FailureStatus ?? HttpStatusCode.BadRequest,
                 accountResult.FailureMessage ?? "Invalid GW2 API key.");
@@ -324,7 +390,6 @@ public static class UploadEndpoints
             return Gw2UploadAccessResult.Failed(HttpStatusCode.BadRequest, "Invalid GW2 API account response.");
         }
 
-        await using var context = await dbContextFactory.CreateDbContextAsync(ct);
         var linkedAccount = await context.GuildWarsAccount
             .AsNoTracking()
             .Where(a => a.GuildWarsAccountId == accountData.Id || a.GuildWarsAccountName == accountName)
@@ -340,7 +405,9 @@ public static class UploadEndpoints
             context,
             linkedAccount.DiscordId,
             guildMembershipService,
-            ct);
+            ct,
+            logger,
+            cache);
 
         return Gw2UploadAccessResult.Success(new Gw2UploadAccess(linkedAccount.DiscordId, accountName, guilds));
     }
@@ -388,8 +455,11 @@ public static class UploadEndpoints
         DatabaseContext context,
         long discordId,
         IDiscordGuildMembershipService guildMembershipService,
-        CancellationToken ct)
+        CancellationToken ct,
+        ILogger<WebApplication> logger,
+        IMemoryCache cache)
     {
+        //logger.LogInformation("Fetching guild id/name from db");
         var configuredGuilds = await context.Guild
             .AsNoTracking()
             .Select(g => new
@@ -399,10 +469,31 @@ public static class UploadEndpoints
             })
             .ToListAsync(ct);
 
+        //logger.LogInformation("guild ids toarray");
         var configuredGuildIds = configuredGuilds
             .Select(g => g.GuildId)
             .ToArray();
+
+        //logger.LogInformation("Checking cache for discord id: " + discordId);
+        if (cache.TryGetValue<IReadOnlySet<long>>(discordId, out var cached))
+        {
+            if (cached != null)
+            {
+                //logger.LogInformation("Found discord member ids from cache");
+                return configuredGuilds
+                    .Where(g => cached.Contains(g.GuildId))
+                    .OrderBy(g => g.GuildName ?? g.GuildId.ToString())
+                    .Select(g => new GuildSummaryDto(g.GuildId.ToString(), g.GuildName ?? g.GuildId.ToString()))
+                    .ToList();
+            }
+        }
+
+        //logger.LogInformation("discord member ids not found in cache, calling GetMemberGuildIdsAsync");
+        MemoryCacheEntryOptions cacheExpire = new MemoryCacheEntryOptions();
+        cacheExpire.SetSlidingExpiration(Gw2GuildMemberIdsCacheTtl);
         var memberGuildIds = await guildMembershipService.GetMemberGuildIdsAsync(discordId, configuredGuildIds, ct);
+        cache.Set(discordId, memberGuildIds, cacheExpire);
+        //logger.LogInformation("Got member guild ids and set cache for discord id: " + discordId);
 
         return configuredGuilds
             .Where(g => memberGuildIds.Contains(g.GuildId))
@@ -439,14 +530,18 @@ public static class UploadEndpoints
         IDbContextFactory<DatabaseContext> dbContextFactory,
         IHttpClientFactory httpClientFactory,
         IDiscordGuildMembershipService guildMembershipService,
-        CancellationToken ct)
+        CancellationToken ct,
+        ILogger<WebApplication> logger,
+        IMemoryCache cache)
     {
         var result = await ResolveGw2UploadAccessAsync(
             request.ApiKey,
             dbContextFactory,
             httpClientFactory,
             guildMembershipService,
-            ct);
+            ct,
+            logger,
+            cache);
         if (result.Access is not { } access)
         {
             return UploadAuthFailure(result.FailureStatus ?? HttpStatusCode.BadRequest, result.FailureMessage);
@@ -646,7 +741,10 @@ public static class UploadEndpoints
             return;
         }
 
-        var identityResult = await ResolveTusUploadIdentityAsync(ctx.HttpContext, ctx.HttpContext.RequestAborted);
+        var logger = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<WebApplication>>();
+        var cache = ctx.HttpContext.RequestServices.GetRequiredService<IMemoryCache>();
+
+        var identityResult = await ResolveTusUploadIdentityAsync(ctx.HttpContext, ctx.HttpContext.RequestAborted, logger, cache);
         if (identityResult.Identity is not { } identity)
         {
             ctx.FailRequest(
