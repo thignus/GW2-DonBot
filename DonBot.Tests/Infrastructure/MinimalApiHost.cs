@@ -31,14 +31,22 @@ internal sealed class MinimalApiHost : IDisposable
 
     public MinimalApiHost(Action<WebApplication> mapEndpoints, Action<IServiceCollection>? configureServices = null, HttpMessageHandler? httpHandler = null)
     {
-        _connection = new SqliteConnection("DataSource=:memory:");
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = $"donbot-tests-{Guid.NewGuid():N}",
+            Mode = SqliteOpenMode.Memory,
+            Cache = SqliteCacheMode.Shared,
+            DefaultTimeout = 30,
+            Pooling = false
+        }.ToString();
+        _connection = new SqliteConnection(connectionString);
         _connection.Open();
 
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Logging.ClearProviders();
 
-        builder.Services.AddDbContextFactory<DatabaseContext>(opts => opts.UseSqlite(_connection));
+        builder.Services.AddDbContextFactory<DatabaseContext>(opts => opts.UseSqlite(connectionString));
 
         if (httpHandler != null)
         {
@@ -56,6 +64,7 @@ internal sealed class MinimalApiHost : IDisposable
         builder.Services.AddSingleton<RaffleService>();
         builder.Services.AddSingleton<ISecretService, TestSecretService>();
         builder.Services.AddSingleton<DiscordRestClientProvider>();
+        builder.Services.AddSingleton<IDiscordUploadDeliveryService, FakeDiscordUploadDeliveryService>();
         builder.Services.AddSingleton<GuildAccessGuard>();
         builder.Services.AddSingleton<AccessibleGuildsCache>();
 
@@ -99,6 +108,8 @@ internal sealed class MinimalApiHost : IDisposable
 
     public IDbContextFactory<DatabaseContext> DbFactory =>
         _server.Services.GetRequiredService<IDbContextFactory<DatabaseContext>>();
+
+    public IServiceProvider Services => _server.Services;
 
     public void AuthenticateAs(long discordId)
     {

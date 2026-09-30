@@ -24,6 +24,8 @@ public sealed class DatabaseContext : DbContext
         ScheduledMessageDelete = Set<ScheduledMessageDelete>();
         RotationAnomaly = Set<RotationAnomaly>();
         LogUpload = Set<LogUpload>();
+        LogUploadDiscordDeliveryReceipt = Set<LogUploadDiscordDeliveryReceipt>();
+        DiscordReportDeliveryClaim = Set<DiscordReportDeliveryClaim>();
     }
 
     public DbSet<Account> Account { get; set; }
@@ -57,6 +59,10 @@ public sealed class DatabaseContext : DbContext
     public DbSet<RotationAnomaly> RotationAnomaly { get; set; }
 
     public DbSet<LogUpload> LogUpload { get; set; }
+
+    public DbSet<LogUploadDiscordDeliveryReceipt> LogUploadDiscordDeliveryReceipt { get; set; }
+
+    public DbSet<DiscordReportDeliveryClaim> DiscordReportDeliveryClaim { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -95,6 +101,25 @@ public sealed class DatabaseContext : DbContext
             .HasIndex(lu => lu.TusFileId)
             .IsUnique();
 
+        modelBuilder.Entity<LogUpload>()
+            .HasIndex(lu => new { lu.DiscordId, lu.GuildId, lu.DpsReportUrl })
+            .IsUnique()
+            .HasFilter("\"SourceType\" = 'url' AND \"GuildId\" > 0 AND \"DpsReportUrl\" IS NOT NULL");
+
+        modelBuilder.Entity<LogUploadDiscordDeliveryReceipt>()
+            .HasIndex(receipt => new { receipt.LogUploadId, receipt.MessageKind })
+            .IsUnique();
+
+        modelBuilder.Entity<LogUploadDiscordDeliveryReceipt>()
+            .HasOne<LogUpload>()
+            .WithMany()
+            .HasForeignKey(receipt => receipt.LogUploadId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<DiscordReportDeliveryClaim>()
+            .HasIndex(claim => new { claim.GuildId, claim.ReportUrlHash })
+            .IsUnique();
+
         modelBuilder.Entity<ScheduledEvent>()
             .Property(se => se.NotificationMinutesBeforeStart)
             .HasDefaultValue((short)15);
@@ -104,6 +129,10 @@ public sealed class DatabaseContext : DbContext
 
         modelBuilder.Entity<PlayerFightLog>()
             .Property(pfl => pfl.AlacDuration)
+            .HasPrecision(6, 2);
+
+        modelBuilder.Entity<PlayerFightLog>()
+            .Property(pfl => pfl.RegenDuration)
             .HasPrecision(6, 2);
 
         modelBuilder.Entity<PlayerFightLog>()

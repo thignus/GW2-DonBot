@@ -67,6 +67,7 @@ public static class EncounterCatalog
             [524550] = OneTarget(FightTypesEnum.Golem),
             [524553] = OneTarget(FightTypesEnum.Golem),
             [524554] = OneTarget(FightTypesEnum.Golem),
+            [263682] = OneTarget(FightTypesEnum.Vloxx)
         };
 
     public static EncounterDefinition ResolvePveEncounter(long encounterId) =>

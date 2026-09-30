@@ -32,6 +32,10 @@ public class Guild
 
     public long? StreamLogChannelId { get; set; }
 
+    public bool MannyUploaderDiscordDeliveryEnabled { get; set; }
+
+    public bool MannyUploaderChannelOverrideEnabled { get; set; }
+
     public bool RaidAlertEnabled { get; set; }
 
     public long? RaidAlertChannelId { get; set; }
@@ -47,6 +51,10 @@ public class Guild
     public bool AutoAggregateLogs { get; set; } = true;
 
     public bool AutoReplySingleLog { get; set; }
+
+    public bool PlayerPointRankingsEnabled { get; set; }
+
+    public long? PlayerPointRankingsChannelId { get; set; }
 
     public bool WvwLeaderboardEnabled { get; set; }
 

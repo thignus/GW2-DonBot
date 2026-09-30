@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Claims;
 using System.Text;
 using DonBot.Api.Services;
+using DonBot.Core.Models;
 using DonBot.Core.Models.Entities;
 using DonBot.Core.Services.GuildWars2;
 using DonBot.Models.Apis.GuildWars2Api;
@@ -17,8 +18,17 @@ namespace DonBot.Api.Endpoints;
 
 public static class UploadEndpoints
 {
+    internal const int MaxConcurrentDiscordCapabilityLookups = 8;
+    private static readonly System.Text.Json.JsonSerializerOptions SseJsonOptions =
+        new(System.Text.Json.JsonSerializerDefaults.Web);
+
+    private static readonly System.Text.Json.JsonSerializerOptions AggregateRequestJsonOptions =
+        new(System.Text.Json.JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = false };
+
     private const string Gw2ApiKeyHeader = "X-GW2-API-Key";
+    private const int MaxAggregateRequestBytes = 16_384;
     private const string TusUploadIdentityItemKey = "donbot:tus-upload-identity";
+    private const string TusDiscordDeliveryItemKey = "donbot:tus-discord-delivery";
 
     public static void MapUploadEndpoints(this WebApplication app)
     {
@@ -29,6 +39,8 @@ public static class UploadEndpoints
         group.MapPost("/wingman/{id:long}", SubmitOneToWingman).RequireAuthorization();
         group.MapPost("/wingman/bulk", SubmitBulkToWingman).RequireAuthorization();
         group.MapPost("/gw2/guilds", ListGw2UploadGuilds).AllowAnonymous();
+        group.MapPost("/gw2/url", SubmitGw2Url).AllowAnonymous();
+        group.MapPost("/gw2/aggregate", SubmitGw2Aggregate).AllowAnonymous();
         group.MapTus("/tus", _ => BuildTusConfigurationAsync(app)).AllowAnonymous();
     }
 
@@ -55,11 +67,24 @@ public static class UploadEndpoints
                         return;
                     }
 
-                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
+                    var guildResult =
+                        await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
 
                     if (guildResult.FailureStatus is { } status)
                     {
                         ctx.FailRequest(status, guildResult.FailureMessage ?? "Invalid guild id.");
+                        return;
+                    }
+
+                    var deliveryResult = await ResolveTusDiscordDeliveryAsync(
+                        ctx.HttpContext,
+                        ctx.Metadata,
+                        guildResult.GuildId,
+                        ctx.CancellationToken);
+                    if (deliveryResult.FailureStatus is { } deliveryStatus)
+                    {
+                        ctx.FailRequest(deliveryStatus,
+                            deliveryResult.FailureMessage ?? "Invalid Discord delivery request.");
                     }
                 },
                 OnCreateCompleteAsync = async ctx =>
@@ -75,11 +100,22 @@ public static class UploadEndpoints
                         : "upload.zevtc";
                     var safeName = Path.GetFileName(filename);
                     var wingman = TryGetMetadataString(ctx.Metadata, "wingman", out var wingmanRaw) &&
-                        string.Equals(wingmanRaw, "true", StringComparison.OrdinalIgnoreCase);
+                                  string.Equals(wingmanRaw, "true", StringComparison.OrdinalIgnoreCase);
 
-                    var guildResult = await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
+                    var guildResult =
+                        await ResolveTusGuildIdAsync(ctx.HttpContext, ctx.Metadata, ctx.CancellationToken);
 
                     if (guildResult.FailureStatus is not null)
+                    {
+                        return;
+                    }
+
+                    var deliveryResult = await ResolveTusDiscordDeliveryAsync(
+                        ctx.HttpContext,
+                        ctx.Metadata,
+                        guildResult.GuildId,
+                        ctx.CancellationToken);
+                    if (deliveryResult.FailureStatus is not null)
                     {
                         return;
                     }
@@ -97,6 +133,8 @@ public static class UploadEndpoints
                         SubmitToWingman = wingman,
                         GuildId = guildResult.GuildId,
                         TusFileId = ctx.FileId,
+                        DiscordDeliveryMode = deliveryResult.Mode,
+                        DiscordDeliveryChannelId = deliveryResult.ChannelId,
                         CreatedAt = DateTime.UtcNow,
                         UpdatedAt = DateTime.UtcNow
                     };
@@ -104,6 +142,10 @@ public static class UploadEndpoints
                     await db.SaveChangesAsync(ctx.CancellationToken);
 
                     ctx.HttpContext.Response.Headers["X-Log-Upload-Id"] = upload.LogUploadId.ToString();
+                    if (deliveryResult.Mode is not null)
+                    {
+                        ctx.HttpContext.Response.Headers["X-DonBot-Discord-Delivery"] = "accepted";
+                    }
                 },
                 OnFileCompleteAsync = async ctx =>
                 {
@@ -264,7 +306,9 @@ public static class UploadEndpoints
                 httpContext.RequestServices.GetRequiredService<IDbContextFactory<DatabaseContext>>(),
                 httpContext.RequestServices.GetRequiredService<IHttpClientFactory>(),
                 httpContext.RequestServices.GetRequiredService<IDiscordGuildMembershipService>(),
-                ct);
+                httpContext.RequestServices.GetRequiredService<IDiscordUploadDeliveryService>(),
+                includeDiscordDelivery: false,
+                ct: ct);
 
             result = access.Access is { } identity
                 ? TusUploadIdentityResult.Success(new TusUploadIdentity(
@@ -286,6 +330,71 @@ public static class UploadEndpoints
         return result;
     }
 
+    private static async Task<TusDiscordDeliveryResolution> ResolveTusDiscordDeliveryAsync(
+        HttpContext httpContext,
+        IReadOnlyDictionary<string, Metadata> metadata,
+        long guildId,
+        CancellationToken ct)
+    {
+        if (httpContext.Items.TryGetValue(TusDiscordDeliveryItemKey, out var cached) &&
+            cached is TusDiscordDeliveryResolution cachedResult)
+        {
+            return cachedResult;
+        }
+
+        var hasMode = TryGetMetadataString(metadata, "discorddelivery", out var mode);
+        var hasChannel = TryGetMetadataString(metadata, "discordchannelid", out var channelIdRaw);
+        TusDiscordDeliveryResolution result;
+        if (!hasMode)
+        {
+            result = hasChannel
+                ? TusDiscordDeliveryResolution.Failed(HttpStatusCode.BadRequest, "Invalid Discord delivery request.")
+                : new TusDiscordDeliveryResolution(null, null);
+        }
+        else if (mode == DiscordDeliveryModes.GuildDefaults && !hasChannel)
+        {
+            result = new TusDiscordDeliveryResolution(DiscordDeliveryModes.GuildDefaults, null);
+        }
+        else if (mode == DiscordDeliveryModes.ChannelOverride &&
+                 hasChannel &&
+                 TryParseCanonicalPositiveInt64(channelIdRaw, out var channelId))
+        {
+            result = new TusDiscordDeliveryResolution(DiscordDeliveryModes.ChannelOverride, channelId);
+        }
+        else
+        {
+            result = TusDiscordDeliveryResolution.Failed(HttpStatusCode.BadRequest,
+                "Invalid Discord delivery request.");
+        }
+
+        if (result.FailureStatus is null && result.Mode is not null)
+        {
+            var identityResult = await ResolveTusUploadIdentityAsync(httpContext, ct);
+            if (identityResult.Identity is not { } identity || guildId <= 0)
+            {
+                result = TusDiscordDeliveryResolution.Failed(HttpStatusCode.Forbidden,
+                    "Discord delivery is not authorized.");
+            }
+            else
+            {
+                var validation = await httpContext.RequestServices
+                    .GetRequiredService<IDiscordUploadDeliveryService>()
+                    .ValidateAsync(identity.DiscordId, guildId, result.Mode, result.ChannelId, ct);
+                if (!validation.Accepted)
+                {
+                    result = TusDiscordDeliveryResolution.Failed(
+                        validation.ErrorCode == "discord_channel_forbidden"
+                            ? HttpStatusCode.Forbidden
+                            : HttpStatusCode.BadRequest,
+                        "Discord delivery is not authorized.");
+                }
+            }
+        }
+
+        httpContext.Items[TusDiscordDeliveryItemKey] = result;
+        return result;
+    }
+
     private static bool TryGetGw2ApiKey(HttpRequest request, out string apiKey)
     {
         apiKey = string.Empty;
@@ -303,17 +412,49 @@ public static class UploadEndpoints
         IDbContextFactory<DatabaseContext> dbContextFactory,
         IHttpClientFactory httpClientFactory,
         IDiscordGuildMembershipService guildMembershipService,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        bool includeDiscordDelivery,
+        CancellationToken ct)
+    {
+        var identityResult = await ResolveGw2UploadIdentityAsync(
+            apiKey,
+            dbContextFactory,
+            httpClientFactory,
+            ct);
+        if (identityResult.Identity is not { } identity)
+        {
+            return Gw2UploadAccessResult.Failed(
+                identityResult.FailureStatus ?? HttpStatusCode.BadRequest,
+                identityResult.FailureMessage ?? "Upload authorization failed.");
+        }
+
+        await using var context = await dbContextFactory.CreateDbContextAsync(ct);
+        var guilds = await ListUploadGuildsForDiscordUserAsync(
+            context,
+            identity.DiscordId,
+            guildMembershipService,
+            discordDeliveryService,
+            includeDiscordDelivery,
+            ct);
+
+        return Gw2UploadAccessResult.Success(new Gw2UploadAccess(identity.DiscordId, identity.AccountName, guilds));
+    }
+
+    private static async Task<Gw2UploadIdentityResult> ResolveGw2UploadIdentityAsync(
+        string? apiKey,
+        IDbContextFactory<DatabaseContext> dbContextFactory,
+        IHttpClientFactory httpClientFactory,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(apiKey))
         {
-            return Gw2UploadAccessResult.Failed(HttpStatusCode.BadRequest, "GW2 API key is required.");
+            return Gw2UploadIdentityResult.Failed(HttpStatusCode.BadRequest, "GW2 API key is required.");
         }
 
         var accountResult = await FetchGw2AccountAsync(apiKey.Trim(), httpClientFactory, ct);
         if (accountResult.Access is not { } accountData)
         {
-            return Gw2UploadAccessResult.Failed(
+            return Gw2UploadIdentityResult.Failed(
                 accountResult.FailureStatus ?? HttpStatusCode.BadRequest,
                 accountResult.FailureMessage ?? "Invalid GW2 API key.");
         }
@@ -321,28 +462,19 @@ public static class UploadEndpoints
         var accountName = accountData.Name?.Trim() ?? string.Empty;
         if (accountData.Id == Guid.Empty || string.IsNullOrWhiteSpace(accountName))
         {
-            return Gw2UploadAccessResult.Failed(HttpStatusCode.BadRequest, "Invalid GW2 API account response.");
+            return Gw2UploadIdentityResult.Failed(HttpStatusCode.BadRequest, "Invalid GW2 API account response.");
         }
 
         await using var context = await dbContextFactory.CreateDbContextAsync(ct);
         var linkedAccount = await context.GuildWarsAccount
             .AsNoTracking()
-            .Where(a => a.GuildWarsAccountId == accountData.Id || a.GuildWarsAccountName == accountName)
-            .Select(a => new { a.DiscordId })
+            .Where(account => account.GuildWarsAccountId == accountData.Id ||
+                              account.GuildWarsAccountName == accountName)
+            .Select(account => new { account.DiscordId })
             .FirstOrDefaultAsync(ct);
-
-        if (linkedAccount is null)
-        {
-            return Gw2UploadAccessResult.Failed(HttpStatusCode.Forbidden, "GW2 account is not linked to DonBot.");
-        }
-
-        var guilds = await ListUploadGuildsForDiscordUserAsync(
-            context,
-            linkedAccount.DiscordId,
-            guildMembershipService,
-            ct);
-
-        return Gw2UploadAccessResult.Success(new Gw2UploadAccess(linkedAccount.DiscordId, accountName, guilds));
+        return linkedAccount is null
+            ? Gw2UploadIdentityResult.Failed(HttpStatusCode.Forbidden, "GW2 account is not linked to DonBot.")
+            : Gw2UploadIdentityResult.Success(new Gw2UploadIdentity(linkedAccount.DiscordId, accountName));
     }
 
     private static async Task<Gw2AccountResult> FetchGw2AccountAsync(
@@ -388,15 +520,14 @@ public static class UploadEndpoints
         DatabaseContext context,
         long discordId,
         IDiscordGuildMembershipService guildMembershipService,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        bool includeDiscordDelivery,
         CancellationToken ct)
     {
         var configuredGuilds = await context.Guild
             .AsNoTracking()
-            .Select(g => new
-            {
-                g.GuildId,
-                g.GuildName
-            })
+            .Where(guild => guild.GuildId > 0)
+            .OrderBy(guild => guild.GuildName ?? guild.GuildId.ToString())
             .ToListAsync(ct);
 
         var configuredGuildIds = configuredGuilds
@@ -404,11 +535,73 @@ public static class UploadEndpoints
             .ToArray();
         var memberGuildIds = await guildMembershipService.GetMemberGuildIdsAsync(discordId, configuredGuildIds, ct);
 
-        return configuredGuilds
+        var authorizedGuilds = configuredGuilds
             .Where(g => memberGuildIds.Contains(g.GuildId))
             .OrderBy(g => g.GuildName ?? g.GuildId.ToString())
-            .Select(g => new GuildSummaryDto(g.GuildId.ToString(), g.GuildName ?? g.GuildId.ToString()))
+            .Take(256)
             .ToList();
+
+        var capabilitiesByGuild = new DiscordDeliveryCapabilities?[authorizedGuilds.Count];
+        if (includeDiscordDelivery)
+        {
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, authorizedGuilds.Count),
+                new ParallelOptions
+                {
+                    CancellationToken = ct,
+                    MaxDegreeOfParallelism = MaxConcurrentDiscordCapabilityLookups
+                },
+                async (index, token) =>
+                {
+                    capabilitiesByGuild[index] = await discordDeliveryService.GetCapabilitiesAsync(
+                        authorizedGuilds[index],
+                        discordId,
+                        token);
+                });
+        }
+
+        var result = new List<GuildSummaryDto>(authorizedGuilds.Count);
+        // A lower practical cap keeps worst-case UTF-8 names within the 256 KiB response budget.
+        var remainingChannels = 384;
+        for (var index = 0; index < authorizedGuilds.Count; index++)
+        {
+            var guild = authorizedGuilds[index];
+            var capabilities = capabilitiesByGuild[index] ??
+                               new DiscordDeliveryCapabilities(false, false, false, [], [], false);
+            var channels = capabilities.Channels
+                .Take(remainingChannels)
+                .Select(channel => new DiscordChannelDto(
+                    channel.ChannelId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    channel.ChannelName))
+                .ToList();
+            remainingChannels -= channels.Count;
+
+            result.Add(new GuildSummaryDto(
+                guild.GuildId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                NormalizeContractName(guild.GuildName ?? guild.GuildId.ToString()),
+                new DiscordDeliveryCapabilitiesDto(
+                    capabilities.Enabled,
+                    capabilities.DefaultsAvailable,
+                    capabilities.ChannelOverrideAllowed,
+                    capabilities.EnabledMessageKinds,
+                    channels,
+                    capabilities.AggregateEnabled,
+                    capabilities.MaxAggregateFightLogs,
+                    capabilities.AggregateDefaultsAvailable)));
+        }
+
+        return result;
+    }
+
+    private static string NormalizeContractName(string value)
+    {
+        var sanitized = new string(value.Where(character => character >= ' ' && character != '\u007f').ToArray());
+        while (Encoding.UTF8.GetByteCount(sanitized) > 256)
+        {
+            sanitized = sanitized[..^1];
+        }
+
+        return sanitized;
     }
 
     private static bool TryGetMetadataString(
@@ -434,11 +627,22 @@ public static class UploadEndpoints
         public static TusGuildResolution Failed(HttpStatusCode status, string message) => new(0, status, message);
     }
 
+    private readonly record struct TusDiscordDeliveryResolution(
+        string? Mode,
+        long? ChannelId,
+        HttpStatusCode? FailureStatus = null,
+        string? FailureMessage = null)
+    {
+        public static TusDiscordDeliveryResolution Failed(HttpStatusCode status, string message) =>
+            new(null, null, status, message);
+    }
+
     private static async Task<IResult> ListGw2UploadGuilds(
         Gw2UploadGuildsRequest request,
         IDbContextFactory<DatabaseContext> dbContextFactory,
         IHttpClientFactory httpClientFactory,
         IDiscordGuildMembershipService guildMembershipService,
+        IDiscordUploadDeliveryService discordDeliveryService,
         CancellationToken ct)
     {
         var result = await ResolveGw2UploadAccessAsync(
@@ -446,7 +650,9 @@ public static class UploadEndpoints
             dbContextFactory,
             httpClientFactory,
             guildMembershipService,
-            ct);
+            discordDeliveryService,
+            includeDiscordDelivery: true,
+            ct: ct);
         if (result.Access is not { } access)
         {
             return UploadAuthFailure(result.FailureStatus ?? HttpStatusCode.BadRequest, result.FailureMessage);
@@ -469,6 +675,582 @@ public static class UploadEndpoints
                 statusCode: (int)status)
         };
     }
+
+    private static async Task<IResult> SubmitGw2Aggregate(
+        HttpContext httpContext,
+        IDbContextFactory<DatabaseContext> dbContextFactory,
+        IHttpClientFactory httpClientFactory,
+        IAggregateDiscordDeliveryService aggregateDeliveryService,
+        IAggregateDeliveryAdmissionService admissionService,
+        CancellationToken ct)
+    {
+        if (!TryGetGw2ApiKey(httpContext.Request, out var apiKey))
+        {
+            return AggregateError(StatusCodes.Status401Unauthorized, "unauthorized");
+        }
+
+        Gw2UploadIdentityResult identityResult;
+        try
+        {
+            identityResult = await ResolveGw2UploadIdentityAsync(
+                apiKey,
+                dbContextFactory,
+                httpClientFactory,
+                ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return AggregateError(StatusCodes.Status500InternalServerError, "server_error");
+        }
+
+        if (identityResult.Identity is not { } identity)
+        {
+            var statusCode = identityResult.FailureStatus switch
+            {
+                HttpStatusCode.Forbidden => StatusCodes.Status403Forbidden,
+                HttpStatusCode.BadGateway => StatusCodes.Status503ServiceUnavailable,
+                _ => StatusCodes.Status401Unauthorized
+            };
+            var errorCode = statusCode switch
+            {
+                StatusCodes.Status403Forbidden => "identity_forbidden",
+                StatusCodes.Status503ServiceUnavailable => "dependency_unavailable",
+                _ => "unauthorized"
+            };
+            return AggregateError(statusCode, errorCode);
+        }
+
+        SubmitGw2AggregateRequest? request;
+        try
+        {
+            request = await ReadAggregateRequestAsync(httpContext.Request, ct);
+        }
+        catch (Exception ex) when (ex is
+                                       System.Text.Json.JsonException or
+                                       BadHttpRequestException or
+                                       NotSupportedException or
+                                       InvalidOperationException)
+        {
+            return AggregateError(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return AggregateError(StatusCodes.Status500InternalServerError, "server_error");
+        }
+
+        if (!TryNormalizeAggregateRequest(request, out var guildId, out var fightLogIds, out var mode,
+                out var channelId))
+        {
+            return AggregateError(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        if (!admissionService.TryAcquire(identity.DiscordId, guildId, out var lease) || lease is null)
+        {
+            return AggregateError(StatusCodes.Status429TooManyRequests, "rate_limited");
+        }
+
+        using (lease)
+        {
+            AggregateDiscordDeliveryAttempt attempt;
+            try
+            {
+                attempt = await aggregateDeliveryService.DeliverAsync(
+                    new AggregateDiscordDeliveryRequest(
+                        identity.DiscordId,
+                        guildId,
+                        fightLogIds,
+                        mode,
+                        channelId),
+                    ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                return AggregateError(StatusCodes.Status500InternalServerError, "server_error");
+            }
+
+            if (attempt.Result is { } result)
+            {
+                var delivery = result.DiscordDelivery;
+                var totalMessages = delivery.Sent + delivery.Skipped + delivery.Failed + delivery.Ambiguous;
+                var normalizedOutcome = DiscordDeliveryResult.FromCounts(
+                    delivery.Sent,
+                    delivery.Skipped,
+                    delivery.Failed,
+                    delivery.Ambiguous).Outcome;
+                if (result.FightLogCount != fightLogIds.Count ||
+                    !delivery.Requested ||
+                    delivery.Sent < 0 ||
+                    delivery.Skipped < 0 ||
+                    delivery.Failed < 0 ||
+                    delivery.Ambiguous < 0 ||
+                    totalMessages is < 1 or > AggregateDiscordDeliveryService.MaxFightLogs ||
+                    !string.Equals(delivery.Outcome, normalizedOutcome, StringComparison.Ordinal))
+                {
+                    return AggregateError(StatusCodes.Status500InternalServerError, "server_error");
+                }
+
+                return Results.Ok(result);
+            }
+
+            return attempt.Failure switch
+            {
+                AggregateDiscordDeliveryFailure.InvalidRequest =>
+                    AggregateError(StatusCodes.Status400BadRequest, "invalid_request"),
+                AggregateDiscordDeliveryFailure.DeliveryDisabled or
+                    AggregateDiscordDeliveryFailure.RouteForbidden =>
+                    AggregateError(StatusCodes.Status403Forbidden, "aggregate_forbidden"),
+                AggregateDiscordDeliveryFailure.FightNotFound =>
+                    AggregateError(StatusCodes.Status404NotFound, "fight_not_found"),
+                AggregateDiscordDeliveryFailure.FightNotReady or
+                    AggregateDiscordDeliveryFailure.NoRenderableMessages =>
+                    AggregateError(StatusCodes.Status409Conflict, "fight_not_ready"),
+                AggregateDiscordDeliveryFailure.DependencyUnavailable =>
+                    AggregateError(StatusCodes.Status503ServiceUnavailable, "dependency_unavailable"),
+                _ => AggregateError(StatusCodes.Status500InternalServerError, "server_error")
+            };
+        }
+    }
+
+    private static async Task<SubmitGw2AggregateRequest?> ReadAggregateRequestAsync(
+        HttpRequest request,
+        CancellationToken ct)
+    {
+        if (!request.HasJsonContentType() || request.ContentLength is > MaxAggregateRequestBytes)
+        {
+            return null;
+        }
+
+        await using var body = new MemoryStream(MaxAggregateRequestBytes);
+        var buffer = new byte[4096];
+        while (true)
+        {
+            var bytesRead = await request.Body.ReadAsync(buffer, ct);
+            if (bytesRead == 0)
+            {
+                break;
+            }
+
+            if (body.Length + bytesRead > MaxAggregateRequestBytes)
+            {
+                return null;
+            }
+
+            await body.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+        }
+
+        if (body.Length == 0)
+        {
+            return null;
+        }
+
+        var json = body.ToArray();
+        using var document = System.Text.Json.JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
+            !HasUniqueJsonProperties(document.RootElement) ||
+            !document.RootElement.TryGetProperty("discordDelivery", out var delivery) ||
+            delivery.ValueKind != System.Text.Json.JsonValueKind.Object ||
+            !HasUniqueJsonProperties(delivery))
+        {
+            return null;
+        }
+
+        return System.Text.Json.JsonSerializer.Deserialize<SubmitGw2AggregateRequest>(json,
+            AggregateRequestJsonOptions);
+    }
+
+    private static bool HasUniqueJsonProperties(System.Text.Json.JsonElement value)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        return value.EnumerateObject().All(property => names.Add(property.Name));
+    }
+
+    private static bool TryNormalizeAggregateRequest(
+        SubmitGw2AggregateRequest? request,
+        out long guildId,
+        out IReadOnlyList<long> fightLogIds,
+        out string mode,
+        out long? channelId)
+    {
+        guildId = 0;
+        fightLogIds = [];
+        mode = string.Empty;
+        channelId = null;
+        if (request is null ||
+            request.AdditionalProperties?.Count > 0 ||
+            !TryParseCanonicalPositiveInt64(request.GuildId, out guildId) ||
+            request.FightLogIds is not { Count: >= 2 and <= AggregateDiscordDeliveryService.MaxFightLogs } ||
+            request.DiscordDelivery is null ||
+            request.DiscordDelivery.AdditionalProperties?.Count > 0)
+        {
+            return false;
+        }
+
+        var parsedFightLogIds = new List<long>(request.FightLogIds.Count);
+        var uniqueFightLogIds = new HashSet<long>();
+        foreach (var fightLogIdRaw in request.FightLogIds)
+        {
+            if (!TryParseCanonicalPositiveInt64(fightLogIdRaw, out var fightLogId) ||
+                !uniqueFightLogIds.Add(fightLogId))
+            {
+                return false;
+            }
+
+            parsedFightLogIds.Add(fightLogId);
+        }
+
+        if (string.Equals(request.DiscordDelivery.Mode, DiscordDeliveryModes.GuildDefaults,
+                StringComparison.Ordinal))
+        {
+            if (request.DiscordDelivery.HasChannelId)
+            {
+                return false;
+            }
+
+            mode = DiscordDeliveryModes.GuildDefaults;
+        }
+        else if (string.Equals(request.DiscordDelivery.Mode, DiscordDeliveryModes.ChannelOverride,
+                     StringComparison.Ordinal) &&
+                 request.DiscordDelivery.ChannelId is
+                     { ValueKind: System.Text.Json.JsonValueKind.String } channelElement &&
+                 TryParseCanonicalPositiveInt64(channelElement.GetString(), out var parsedChannelId))
+        {
+            mode = DiscordDeliveryModes.ChannelOverride;
+            channelId = parsedChannelId;
+        }
+        else
+        {
+            return false;
+        }
+
+        fightLogIds = parsedFightLogIds;
+        return true;
+    }
+
+    private static IResult AggregateError(int statusCode, string errorCode) =>
+        Results.Json(new Gw2UrlErrorResponse(errorCode), statusCode: statusCode);
+
+    private static async Task<IResult> SubmitGw2Url(
+        HttpContext httpContext,
+        IDbContextFactory<DatabaseContext> dbContextFactory,
+        IHttpClientFactory httpClientFactory,
+        IDiscordGuildMembershipService guildMembershipService,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        LogUploadPipelineService pipeline,
+        CancellationToken ct)
+    {
+        if (!TryGetGw2ApiKey(httpContext.Request, out var apiKey))
+        {
+            return Gw2UrlError(StatusCodes.Status400BadRequest, "gw2_api_key_required");
+        }
+
+        Gw2UploadAccessResult accessResult;
+        try
+        {
+            accessResult = await ResolveGw2UploadAccessAsync(
+                apiKey,
+                dbContextFactory,
+                httpClientFactory,
+                guildMembershipService,
+                discordDeliveryService,
+                includeDiscordDelivery: false,
+                ct: ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return Gw2UrlError(StatusCodes.Status500InternalServerError, "server_error");
+        }
+
+        if (accessResult.Access is not { } access)
+        {
+            var statusCode = accessResult.FailureStatus switch
+            {
+                HttpStatusCode.Forbidden => StatusCodes.Status403Forbidden,
+                HttpStatusCode.Unauthorized => StatusCodes.Status401Unauthorized,
+                HttpStatusCode.BadRequest => StatusCodes.Status400BadRequest,
+                HttpStatusCode.BadGateway => StatusCodes.Status502BadGateway,
+                _ => StatusCodes.Status500InternalServerError
+            };
+            var errorCode = statusCode switch
+            {
+                StatusCodes.Status403Forbidden => "gw2_account_not_linked",
+                StatusCodes.Status400BadRequest or StatusCodes.Status401Unauthorized => "invalid_gw2_api_key",
+                _ => "upload_authorization_failed"
+            };
+            return Gw2UrlError(statusCode, errorCode);
+        }
+
+        SubmitGw2UrlRequest? request;
+        try
+        {
+            request = await httpContext.Request.ReadFromJsonAsync<SubmitGw2UrlRequest>(cancellationToken: ct);
+        }
+        catch (Exception ex) when (ex is
+                                       System.Text.Json.JsonException or
+                                       BadHttpRequestException or
+                                       NotSupportedException or
+                                       InvalidOperationException)
+        {
+            return Gw2UrlError(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return Gw2UrlError(StatusCodes.Status500InternalServerError, "server_error");
+        }
+
+        if (request is null ||
+            request.AdditionalProperties?.Keys.Any(property =>
+                string.Equals(property, "wingman", StringComparison.OrdinalIgnoreCase)) == true ||
+            !TryParseCanonicalReportPermalink(request.Url, out var parsedUrl) ||
+            !TryParseCanonicalPositiveInt64(request.GuildId, out var guildId))
+        {
+            return Gw2UrlError(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        if (!access.Guilds.Any(guild => string.Equals(guild.GuildId, request.GuildId, StringComparison.Ordinal)))
+        {
+            return Gw2UrlError(StatusCodes.Status403Forbidden, "guild_forbidden");
+        }
+
+        if (!TryNormalizeDiscordDelivery(request.DiscordDelivery, out var deliveryMode, out var deliveryChannelId))
+        {
+            return Gw2UrlError(StatusCodes.Status400BadRequest, "invalid_discord_delivery");
+        }
+
+        if (deliveryMode is not null)
+        {
+            var deliveryValidation = await discordDeliveryService.ValidateAsync(
+                access.DiscordId,
+                guildId,
+                deliveryMode,
+                deliveryChannelId,
+                ct);
+            if (!deliveryValidation.Accepted)
+            {
+                return Gw2UrlError(
+                    deliveryValidation.ErrorCode == "discord_channel_forbidden"
+                        ? StatusCodes.Status403Forbidden
+                        : StatusCodes.Status400BadRequest,
+                    deliveryValidation.ErrorCode ?? "invalid_discord_delivery");
+            }
+        }
+
+        try
+        {
+            await using var context = await dbContextFactory.CreateDbContextAsync(ct);
+            var existing = await FindGw2UrlImportAsync(
+                context,
+                access.DiscordId,
+                guildId,
+                parsedUrl.CanonicalUrl,
+                ct);
+            if (existing is not null)
+            {
+                return await ExistingGw2UrlImportAsync(
+                    existing,
+                    deliveryMode,
+                    deliveryChannelId,
+                    discordDeliveryService,
+                    ct);
+            }
+
+            var now = DateTime.UtcNow;
+            var upload = new LogUpload
+            {
+                DiscordId = access.DiscordId,
+                GuildId = guildId,
+                FileName = parsedUrl.Permalink,
+                SourceType = "url",
+                Status = "pending",
+                DpsReportUrl = parsedUrl.CanonicalUrl,
+                SubmitToWingman = false,
+                DiscordDeliveryMode = deliveryMode,
+                DiscordDeliveryChannelId = deliveryChannelId,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            context.LogUpload.Add(upload);
+
+            try
+            {
+                await context.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException)
+            {
+                context.ChangeTracker.Clear();
+                existing = await FindGw2UrlImportAsync(
+                    context,
+                    access.DiscordId,
+                    guildId,
+                    parsedUrl.CanonicalUrl,
+                    ct);
+                if (existing is null)
+                {
+                    return Gw2UrlError(StatusCodes.Status500InternalServerError, "server_error");
+                }
+
+                return await ExistingGw2UrlImportAsync(
+                    existing,
+                    deliveryMode,
+                    deliveryChannelId,
+                    discordDeliveryService,
+                    ct);
+            }
+
+            pipeline.Enqueue(upload.LogUploadId);
+            return Results.Accepted(value: Gw2UrlResponse.From(upload, duplicate: false, discordDelivery: null));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return Gw2UrlError(StatusCodes.Status500InternalServerError, "server_error");
+        }
+    }
+
+    private static bool TryParseCanonicalReportPermalink(string? url, out ParsedReportUrl parsedUrl)
+    {
+        parsedUrl = null!;
+        if (string.IsNullOrEmpty(url) ||
+            Encoding.UTF8.GetByteCount(url) > 2048 ||
+            url.Any(character => character == '\\' || char.IsControl(character)) ||
+            !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            !string.IsNullOrEmpty(uri.UserInfo) ||
+            !string.IsNullOrEmpty(uri.Fragment) ||
+            !string.IsNullOrEmpty(uri.Query) ||
+            !uri.IsDefaultPort ||
+            !ReportUrlHelper.TryParseReportUrl(url, out parsedUrl, requireHttps: true) ||
+            !IsCanonicalReportHost(parsedUrl) ||
+            !string.Equals(url, parsedUrl.CanonicalUrl, StringComparison.Ordinal))
+        {
+            parsedUrl = null!;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsCanonicalReportHost(ParsedReportUrl parsedUrl) =>
+        parsedUrl.Kind switch
+        {
+            ReportUrlKind.DpsReport => string.Equals(parsedUrl.Host, "dps.report", StringComparison.Ordinal),
+            ReportUrlKind.WvwReport => string.Equals(parsedUrl.Host, "wvw.report", StringComparison.Ordinal),
+            _ => false
+        };
+
+    private static bool TryParseCanonicalPositiveInt64(string? value, out long result)
+    {
+        result = 0;
+        return !string.IsNullOrEmpty(value) &&
+               long.TryParse(value, System.Globalization.NumberStyles.None,
+                   System.Globalization.CultureInfo.InvariantCulture, out result) &&
+               result > 0 &&
+               string.Equals(value, result.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                   StringComparison.Ordinal);
+    }
+
+    private static bool TryNormalizeDiscordDelivery(
+        SubmitDiscordDeliveryRequest? request,
+        out string? mode,
+        out long? channelId)
+    {
+        mode = null;
+        channelId = null;
+        if (request is null)
+        {
+            return true;
+        }
+
+        if (request.AdditionalProperties?.Count > 0)
+        {
+            return false;
+        }
+
+        if (string.Equals(request.Mode, DiscordDeliveryModes.GuildDefaults, StringComparison.Ordinal))
+        {
+            if (request.ChannelId.HasValue)
+            {
+                return false;
+            }
+
+            mode = DiscordDeliveryModes.GuildDefaults;
+            return true;
+        }
+
+        if (!string.Equals(request.Mode, DiscordDeliveryModes.ChannelOverride, StringComparison.Ordinal) ||
+            request.ChannelId is not { ValueKind: System.Text.Json.JsonValueKind.String } channelElement ||
+            !TryParseCanonicalPositiveInt64(channelElement.GetString(), out var parsedChannelId))
+        {
+            return false;
+        }
+
+        mode = DiscordDeliveryModes.ChannelOverride;
+        channelId = parsedChannelId;
+        return true;
+    }
+
+    private static Task<LogUpload?> FindGw2UrlImportAsync(
+        DatabaseContext context,
+        long discordId,
+        long guildId,
+        string canonicalUrl,
+        CancellationToken ct) =>
+        context.LogUpload
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                upload => upload.DiscordId == discordId &&
+                          upload.GuildId == guildId &&
+                          upload.DpsReportUrl == canonicalUrl &&
+                          upload.SourceType == "url",
+                ct);
+
+    private static async Task<IResult> ExistingGw2UrlImportAsync(
+        LogUpload upload,
+        string? requestedDeliveryMode,
+        long? requestedDeliveryChannelId,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        CancellationToken ct)
+    {
+        if (string.Equals(upload.Status, "failed", StringComparison.Ordinal))
+        {
+            return Gw2UrlError(StatusCodes.Status409Conflict, "import_failed");
+        }
+
+        if (!string.Equals(upload.DiscordDeliveryMode, requestedDeliveryMode, StringComparison.Ordinal) ||
+            upload.DiscordDeliveryChannelId != requestedDeliveryChannelId)
+        {
+            return Gw2UrlError(StatusCodes.Status409Conflict, "discord_delivery_conflict");
+        }
+
+        var deliveryResult = upload.Status == "complete" && upload.DiscordDeliveryMode is not null
+            ? await discordDeliveryService.GetResultAsync(upload.LogUploadId, ct)
+            : null;
+        return Results.Ok(Gw2UrlResponse.From(upload, duplicate: true, deliveryResult));
+    }
+
+    private static IResult Gw2UrlError(int statusCode, string errorCode) =>
+        Results.Json(new Gw2UrlErrorResponse(errorCode), statusCode: statusCode);
 
     private static async Task<IResult> SubmitUrls(
         SubmitUrlsRequest request,
@@ -532,14 +1314,85 @@ public static class UploadEndpoints
     private static async Task StreamProgress(
         long id,
         ILogUploadProgressService progress,
+        IDbContextFactory<DatabaseContext> dbContextFactory,
+        IDiscordUploadDeliveryService discordDeliveryService,
         HttpContext ctx,
         CancellationToken ct)
     {
-        SseWriter.Prepare(ctx.Response);
-
-        await foreach (var msg in progress.Subscribe(id, ct))
+        var identityResult = await ResolveTusUploadIdentityAsync(ctx, ct);
+        if (identityResult.Identity is not { } identity)
         {
-            await SseWriter.WriteDataAsync(ctx.Response, msg, ct);
+            ctx.Response.StatusCode = (int)(identityResult.FailureStatus ?? HttpStatusCode.Unauthorized);
+            return;
+        }
+
+        await using (var context = await dbContextFactory.CreateDbContextAsync(ct))
+        {
+            var upload = await context.LogUpload.AsNoTracking()
+                .FirstOrDefaultAsync(
+                    item => item.LogUploadId == id && item.DiscordId == identity.DiscordId,
+                    ct);
+            if (upload is null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            SseWriter.Prepare(ctx.Response);
+            if (upload?.Status == "complete")
+            {
+                var deliveryResult = await discordDeliveryService.GetResultAsync(id, ct);
+                var payload = System.Text.Json.JsonSerializer.Serialize(
+                    new
+                    {
+                        stage = "complete",
+                        message = "Done.",
+                        dpsReportUrl = upload.DpsReportUrl,
+                        fightLogId = upload.FightLogId,
+                        discordDelivery = deliveryResult
+                    },
+                    SseJsonOptions);
+                await SseWriter.WriteDataAsync(ctx.Response, payload, ct);
+                return;
+            }
+
+            if (upload?.Status == "failed")
+            {
+                var payload = System.Text.Json.JsonSerializer.Serialize(
+                    new
+                    {
+                        stage = "failed",
+                        message = upload.ErrorMessage ?? "Upload processing failed.",
+                        dpsReportUrl = upload.DpsReportUrl,
+                        fightLogId = upload.FightLogId,
+                        discordDelivery = upload.DiscordDeliveryMode is null
+                            ? DiscordDeliveryResult.NotRequested
+                            : await discordDeliveryService.GetResultAsync(id, ct)
+                    },
+                    SseJsonOptions);
+                await SseWriter.WriteDataAsync(ctx.Response, payload, ct);
+                return;
+            }
+        }
+
+        await WriteProgressStreamAsync(id, progress, ctx.Response, ct);
+    }
+
+    internal static async Task WriteProgressStreamAsync(
+        long id,
+        ILogUploadProgressService progress,
+        HttpResponse response,
+        CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var msg in progress.Subscribe(id, ct))
+            {
+                await SseWriter.WriteDataAsync(response, msg, ct);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
     }
 
@@ -561,6 +1414,7 @@ public static class UploadEndpoints
         {
             return Results.NotFound();
         }
+
         if (string.IsNullOrEmpty(upload.DpsReportUrl))
         {
             return Results.BadRequest("No dps.report URL available.");
@@ -585,7 +1439,8 @@ public static class UploadEndpoints
 
         await using var ctx = await dbContextFactory.CreateDbContextAsync();
         var uploads = await ctx.LogUpload
-            .Where(u => u.DiscordId == discordId && u.Status == "complete" && u.CreatedAt >= cutoff && u.DpsReportUrl != null)
+            .Where(u => u.DiscordId == discordId && u.Status == "complete" && u.CreatedAt >= cutoff &&
+                        u.DpsReportUrl != null)
             .Select(u => u.DpsReportUrl!)
             .ToListAsync();
 
@@ -688,19 +1543,119 @@ public static class UploadEndpoints
         public string? ApiKey { get; init; }
     }
 
+    private sealed class SubmitGw2UrlRequest
+    {
+        public string? Url { get; init; }
+
+        public string? GuildId { get; init; }
+
+        public SubmitDiscordDeliveryRequest? DiscordDelivery { get; init; }
+
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, System.Text.Json.JsonElement>? AdditionalProperties { get; init; }
+    }
+
+    private sealed class SubmitDiscordDeliveryRequest
+    {
+        public string? Mode { get; init; }
+
+        public System.Text.Json.JsonElement? ChannelId { get; init; }
+
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, System.Text.Json.JsonElement>? AdditionalProperties { get; init; }
+    }
+
+    private sealed class SubmitGw2AggregateRequest
+    {
+        public string? GuildId { get; init; }
+
+        public List<string>? FightLogIds { get; init; }
+
+        public SubmitAggregateDiscordDeliveryRequest? DiscordDelivery { get; init; }
+
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, System.Text.Json.JsonElement>? AdditionalProperties { get; init; }
+    }
+
+    private sealed class SubmitAggregateDiscordDeliveryRequest
+    {
+        private System.Text.Json.JsonElement? _channelId;
+
+        public string? Mode { get; init; }
+
+        public System.Text.Json.JsonElement? ChannelId
+        {
+            get => _channelId;
+            init
+            {
+                _channelId = value;
+                HasChannelId = true;
+            }
+        }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool HasChannelId { get; private set; }
+
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, System.Text.Json.JsonElement>? AdditionalProperties { get; init; }
+    }
+
+    private sealed record Gw2UrlResponse(
+        long UploadId,
+        long? FightLogId,
+        string Status,
+        bool Duplicate,
+        bool DiscordDeliveryAccepted,
+        DiscordDeliveryResult? DiscordDelivery)
+    {
+        public static Gw2UrlResponse From(
+            LogUpload upload,
+            bool duplicate,
+            DiscordDeliveryResult? discordDelivery) =>
+            new(
+                upload.LogUploadId,
+                upload.FightLogId is > 0 ? upload.FightLogId : null,
+                upload.Status,
+                duplicate,
+                upload.DiscordDeliveryMode is not null,
+                discordDelivery);
+    }
+
+    private sealed record Gw2UrlErrorResponse(string Error);
+
     private sealed class Gw2UploadGuildsResponse(string accountName, IReadOnlyList<GuildSummaryDto> guilds)
     {
         public string AccountName { get; } = accountName;
 
+        public IReadOnlyList<string> Capabilities { get; } =
+            ["discord-summary-delivery-v1", "discord-aggregate-delivery-v1"];
+
         public IReadOnlyList<GuildSummaryDto> Guilds { get; } = guilds;
     }
 
-    private sealed class GuildSummaryDto(string guildId, string guildName)
+    private sealed class GuildSummaryDto(
+        string guildId,
+        string guildName,
+        DiscordDeliveryCapabilitiesDto discordDelivery)
     {
         public string GuildId { get; } = guildId;
 
         public string GuildName { get; } = guildName;
+
+        public DiscordDeliveryCapabilitiesDto DiscordDelivery { get; } = discordDelivery;
     }
+
+    private sealed record DiscordDeliveryCapabilitiesDto(
+        bool Enabled,
+        bool DefaultsAvailable,
+        bool ChannelOverrideAllowed,
+        IReadOnlyList<string> EnabledMessageKinds,
+        IReadOnlyList<DiscordChannelDto> Channels,
+        bool AggregateEnabled,
+        int MaxAggregateFightLogs,
+        bool AggregateDefaultsAvailable);
+
+    private sealed record DiscordChannelDto(string ChannelId, string ChannelName);
 
     private sealed record TusUploadIdentity(long DiscordId, IReadOnlySet<long>? AllowedGuildIds);
 
@@ -711,10 +1666,24 @@ public static class UploadEndpoints
     {
         public static TusUploadIdentityResult Success(TusUploadIdentity identity) => new(identity, null, null);
 
-        public static TusUploadIdentityResult Failed(HttpStatusCode status, string message) => new(null, status, message);
+        public static TusUploadIdentityResult Failed(HttpStatusCode status, string message) =>
+            new(null, status, message);
     }
 
     private sealed record Gw2UploadAccess(long DiscordId, string AccountName, IReadOnlyList<GuildSummaryDto> Guilds);
+
+    private sealed record Gw2UploadIdentity(long DiscordId, string AccountName);
+
+    private sealed record Gw2UploadIdentityResult(
+        Gw2UploadIdentity? Identity,
+        HttpStatusCode? FailureStatus,
+        string? FailureMessage)
+    {
+        public static Gw2UploadIdentityResult Success(Gw2UploadIdentity identity) => new(identity, null, null);
+
+        public static Gw2UploadIdentityResult Failed(HttpStatusCode status, string message) =>
+            new(null, status, message);
+    }
 
     private sealed record Gw2UploadAccessResult(
         Gw2UploadAccess? Access,

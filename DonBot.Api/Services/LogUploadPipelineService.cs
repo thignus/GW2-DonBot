@@ -12,6 +12,8 @@ namespace DonBot.Api.Services;
 
 public sealed class LogUploadPipelineService : BackgroundService
 {
+    private const string MissingSourceFileMessage = "Upload source file is no longer available.";
+
     private readonly ILogUploadProgressService _progress;
     private readonly IDbContextFactory<DatabaseContext> _dbContextFactory;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -45,8 +47,12 @@ public sealed class LogUploadPipelineService : BackgroundService
 
     public void Enqueue(long uploadId) => _queue.Writer.TryWrite(uploadId);
 
+    internal bool TryReadQueuedUpload(out long uploadId) => _queue.Reader.TryRead(out uploadId);
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
+        await RecoverInterruptedUploadsAsync(ct);
+
         await foreach (var uploadId in _queue.Reader.ReadAllAsync(ct))
         {
             await _concurrency.WaitAsync(ct);
@@ -58,14 +64,21 @@ public sealed class LogUploadPipelineService : BackgroundService
         }
     }
 
-    private async Task ProcessUploadAsync(long uploadId, CancellationToken ct)
+    internal async Task ProcessUploadAsync(long uploadId, CancellationToken ct)
     {
         try
         {
+            if (!await TryClaimUploadAsync(uploadId, ct))
+            {
+                return;
+            }
+
             await using var scope = _scopeFactory.CreateAsyncScope();
             var dataModelGenerationService = scope.ServiceProvider.GetRequiredService<IDataModelGenerationService>();
             var playerService = scope.ServiceProvider.GetRequiredService<IPlayerService>();
             var pointsAwardService = scope.ServiceProvider.GetRequiredService<IPointsAwardService>();
+            var rotationAnalysisService = scope.ServiceProvider.GetRequiredService<IRotationAnalysisService>();
+            var discordDeliveryService = scope.ServiceProvider.GetRequiredService<IDiscordUploadDeliveryService>();
 
             await using var ctx = await _dbContextFactory.CreateDbContextAsync(ct);
             var upload = await ctx.LogUpload.FirstOrDefaultAsync(u => u.LogUploadId == uploadId, ct);
@@ -74,25 +87,69 @@ public sealed class LogUploadPipelineService : BackgroundService
                 return;
             }
 
+            if (upload.FightLogId is > 0 && !string.IsNullOrWhiteSpace(upload.DpsReportUrl))
+            {
+                var recoveredModel = await dataModelGenerationService.GenerateEliteInsightDataModelFromUrl(upload.DpsReportUrl);
+                await CompleteAfterIngestionAsync(upload, recoveredModel, discordDeliveryService, ct);
+                return;
+            }
+
             if (upload.SourceType == "url")
             {
-                await ProcessUrlUploadAsync(ctx, upload, dataModelGenerationService, playerService, pointsAwardService, ct);
+                await ProcessUrlUploadAsync(
+                    ctx,
+                    upload,
+                    dataModelGenerationService,
+                    playerService,
+                    pointsAwardService,
+                    rotationAnalysisService,
+                    discordDeliveryService,
+                    ct);
             }
             else
             {
-                await ProcessFileUploadAsync(ctx, upload, dataModelGenerationService, playerService, pointsAwardService, ct);
+                await ProcessFileUploadAsync(
+                    ctx,
+                    upload,
+                    dataModelGenerationService,
+                    playerService,
+                    pointsAwardService,
+                    rotationAnalysisService,
+                    discordDeliveryService,
+                    ct);
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Upload pipeline failed for upload {id}", uploadId);
-            await MarkFailedAsync(uploadId, ex.Message, ct);
-            _progress.Publish(uploadId, "failed", ex.Message);
-            _progress.Complete(uploadId);
+            const string publicMessage = "Upload processing failed.";
+            _logger.LogError(
+                "Upload pipeline failed for upload {id} with exception type {exceptionType}",
+                uploadId,
+                ex.GetType().Name);
+            if (!await CompleteIngestedAfterFailureAsync(uploadId, ct))
+            {
+                if (await MarkFailedAsync(uploadId, publicMessage, ct))
+                {
+                    CleanupUploadDirectories(uploadId);
+                }
+                _progress.Publish(uploadId, "failed", publicMessage);
+                _progress.Complete(uploadId);
+            }
         }
     }
 
-    private async Task ProcessUrlUploadAsync(DatabaseContext ctx, LogUpload upload, IDataModelGenerationService dataModelGenerationService, IPlayerService playerService, IPointsAwardService pointsAwardService, CancellationToken ct)
+    private async Task ProcessUrlUploadAsync(
+        DatabaseContext ctx,
+        LogUpload upload,
+        IDataModelGenerationService dataModelGenerationService,
+        IPlayerService playerService,
+        IPointsAwardService pointsAwardService,
+        IRotationAnalysisService rotationAnalysisService,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        CancellationToken ct)
     {
         var uploadId = upload.LogUploadId;
         var url = upload.DpsReportUrl!;
@@ -109,19 +166,34 @@ public sealed class LogUploadPipelineService : BackgroundService
         await UpdateStatus(ctx, upload, "saving", ct);
         _progress.Publish(uploadId, "saving", "Saving log data...");
 
-        var fightLogId = await SaveFightLogAsync(model, playerService, pointsAwardService, ct);
+        var fightLogId = await SaveFightLogAsync(
+            model,
+            playerService,
+            pointsAwardService,
+            rotationAnalysisService,
+            ct,
+            upload.GuildId);
 
         if (upload.SubmitToWingman)
         {
             FireAndForgetWingman(modelUrl);
         }
 
-        await FinalizeAsync(uploadId, modelUrl, fightLogId, ct);
-        _progress.Publish(uploadId, "complete", "Done.", modelUrl, fightLogId);
-        _progress.Complete(uploadId);
+        await CheckpointFightAsync(uploadId, modelUrl, fightLogId, ct);
+        upload.DpsReportUrl = modelUrl;
+        upload.FightLogId = fightLogId;
+        await CompleteAfterIngestionAsync(upload, model, discordDeliveryService, ct);
     }
 
-    private async Task ProcessFileUploadAsync(DatabaseContext ctx, LogUpload upload, IDataModelGenerationService dataModelGenerationService, IPlayerService playerService, IPointsAwardService pointsAwardService, CancellationToken ct)
+    private async Task ProcessFileUploadAsync(
+        DatabaseContext ctx,
+        LogUpload upload,
+        IDataModelGenerationService dataModelGenerationService,
+        IPlayerService playerService,
+        IPointsAwardService pointsAwardService,
+        IRotationAnalysisService rotationAnalysisService,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        CancellationToken ct)
     {
         var uploadId = upload.LogUploadId;
         var storagePath = _configuration["Upload:StoragePath"] ?? "/tmp/donbot/uploads";
@@ -132,6 +204,7 @@ public sealed class LogUploadPipelineService : BackgroundService
 
         var evtcPath = Path.Combine(storagePath, uploadId.ToString(), upload.FileName);
         var jobOutputDir = Path.Combine(eiOutputBasePath, uploadId.ToString());
+        var cleanupSafe = false;
 
         try
         {
@@ -207,15 +280,30 @@ public sealed class LogUploadPipelineService : BackgroundService
                 ? dpsReportUrl
                 : model.FightEliteInsightDataModel.Url;
             modelUrl = ReportUrlHelper.CanonicalizeReportUrl(modelUrl, requireHttps: true);
-            var fightLogId = await SaveFightLogAsync(model, playerService, pointsAwardService, ct, upload.GuildId);
+            var fightLogId = await SaveFightLogAsync(
+                model,
+                playerService,
+                pointsAwardService,
+                rotationAnalysisService,
+                ct,
+                upload.GuildId);
 
-            await FinalizeAsync(uploadId, modelUrl, fightLogId, ct);
-            _progress.Publish(uploadId, "complete", "Done.", modelUrl, fightLogId);
-            _progress.Complete(uploadId);
+            await CheckpointFightAsync(uploadId, modelUrl, fightLogId, ct);
+            cleanupSafe = true;
+            upload.DpsReportUrl = modelUrl;
+            upload.FightLogId = fightLogId;
+            await CompleteAfterIngestionAsync(upload, model, discordDeliveryService, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         finally
         {
-            Cleanup(evtcPath, jobOutputDir);
+            if (cleanupSafe)
+            {
+                Cleanup(evtcPath, jobOutputDir);
+            }
         }
     }
 
@@ -333,6 +421,157 @@ public sealed class LogUploadPipelineService : BackgroundService
         });
     }
 
+    internal async Task RecoverInterruptedUploadsAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var discordDeliveryService = scope.ServiceProvider.GetRequiredService<IDiscordUploadDeliveryService>();
+        await discordDeliveryService.NormalizeInterruptedAsync(ct);
+
+        await using var context = await _dbContextFactory.CreateDbContextAsync(ct);
+        var uploads = await context.LogUpload.AsTracking()
+            .Where(upload => upload.Status == "pending" ||
+                upload.Status == "stored" ||
+                upload.Status == "processing" ||
+                upload.Status == "parsing" ||
+                upload.Status == "uploading" ||
+                upload.Status == "saving" ||
+                upload.Status == "delivering")
+            .ToListAsync(ct);
+
+        var storagePath = _configuration["Upload:StoragePath"] ?? "/tmp/donbot/uploads";
+        var now = DateTime.UtcNow;
+        var queuedUploadIds = new List<long>(uploads.Count);
+        var missingUploadIds = new List<long>();
+        foreach (var upload in uploads)
+        {
+            var canResumeWithoutSource = upload.SourceType == "url" ||
+                (upload.FightLogId is > 0 && !string.IsNullOrWhiteSpace(upload.DpsReportUrl));
+            var sourcePath = Path.Combine(storagePath, upload.LogUploadId.ToString(), upload.FileName);
+            if (!canResumeWithoutSource && !File.Exists(sourcePath))
+            {
+                upload.Status = "failed";
+                upload.ErrorMessage = MissingSourceFileMessage;
+                upload.UpdatedAt = now;
+                missingUploadIds.Add(upload.LogUploadId);
+                continue;
+            }
+
+            upload.Status = "pending";
+            upload.ErrorMessage = null;
+            upload.UpdatedAt = now;
+            queuedUploadIds.Add(upload.LogUploadId);
+        }
+
+        await context.SaveChangesAsync(ct);
+
+        foreach (var uploadId in missingUploadIds)
+        {
+            CleanupUploadDirectories(uploadId);
+            _progress.Complete(uploadId);
+        }
+        if (missingUploadIds.Count > 0)
+        {
+            _logger.LogWarning(
+                "Marked {count} interrupted file uploads failed because their source files were unavailable",
+                missingUploadIds.Count);
+        }
+
+        foreach (var uploadId in queuedUploadIds)
+        {
+            Enqueue(uploadId);
+        }
+    }
+
+    private async Task<bool> TryClaimUploadAsync(long uploadId, CancellationToken ct)
+    {
+        await using var context = await _dbContextFactory.CreateDbContextAsync(ct);
+        var claimed = await context.LogUpload
+            .Where(upload => upload.LogUploadId == uploadId &&
+                (upload.Status == "pending" ||
+                    upload.Status == "stored"))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(upload => upload.Status, "processing")
+                    .SetProperty(upload => upload.UpdatedAt, DateTime.UtcNow),
+                ct);
+        return claimed == 1;
+    }
+
+    private async Task CheckpointFightAsync(
+        long uploadId,
+        string dpsReportUrl,
+        long fightLogId,
+        CancellationToken ct)
+    {
+        await using var context = await _dbContextFactory.CreateDbContextAsync(ct);
+        var upload = await context.LogUpload.FirstOrDefaultAsync(item => item.LogUploadId == uploadId, ct);
+        if (upload is null)
+        {
+            return;
+        }
+
+        upload.Status = "delivering";
+        upload.DpsReportUrl = dpsReportUrl;
+        upload.FightLogId = fightLogId;
+        upload.ErrorMessage = null;
+        upload.UpdatedAt = DateTime.UtcNow;
+        context.LogUpload.Update(upload);
+        await context.SaveChangesAsync(ct);
+    }
+
+    private async Task CompleteAfterIngestionAsync(
+        LogUpload upload,
+        EliteInsightDataModel model,
+        IDiscordUploadDeliveryService discordDeliveryService,
+        CancellationToken ct)
+    {
+        var deliveryResult = await discordDeliveryService.DeliverAsync(upload, model, ct);
+        await FinalizeAsync(upload.LogUploadId, upload.DpsReportUrl, upload.FightLogId, ct);
+        _progress.Publish(
+            upload.LogUploadId,
+            "complete",
+            "Done.",
+            upload.DpsReportUrl,
+            upload.FightLogId,
+            deliveryResult);
+        _progress.Complete(upload.LogUploadId);
+    }
+
+    private async Task<bool> CompleteIngestedAfterFailureAsync(long uploadId, CancellationToken ct)
+    {
+        try
+        {
+            await using var context = await _dbContextFactory.CreateDbContextAsync(ct);
+            var upload = await context.LogUpload.AsNoTracking()
+                .FirstOrDefaultAsync(item => item.LogUploadId == uploadId, ct);
+            if (upload?.FightLogId is not > 0)
+            {
+                return false;
+            }
+
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var deliveryService = scope.ServiceProvider.GetRequiredService<IDiscordUploadDeliveryService>();
+            var deliveryResult = await deliveryService.RecordFailureAsync(
+                uploadId,
+                "delivery_processing_failed",
+                ct);
+            await FinalizeAsync(uploadId, upload.DpsReportUrl, upload.FightLogId, ct);
+            _progress.Publish(
+                uploadId,
+                "complete",
+                "Done.",
+                upload.DpsReportUrl,
+                upload.FightLogId,
+                deliveryResult);
+            _progress.Complete(uploadId);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private async Task FinalizeAsync(long uploadId, string? dpsReportUrl, long? fightLogId, CancellationToken ct)
     {
         await using var ctx = await _dbContextFactory.CreateDbContextAsync(ct);
@@ -344,12 +583,13 @@ public sealed class LogUploadPipelineService : BackgroundService
         upload.Status = "complete";
         upload.DpsReportUrl = dpsReportUrl;
         upload.FightLogId = fightLogId;
+        upload.ErrorMessage = null;
         upload.UpdatedAt = DateTime.UtcNow;
         ctx.LogUpload.Update(upload);
         await ctx.SaveChangesAsync(ct);
     }
 
-    private async Task MarkFailedAsync(long uploadId, string message, CancellationToken ct)
+    private async Task<bool> MarkFailedAsync(long uploadId, string message, CancellationToken ct)
     {
         try
         {
@@ -357,15 +597,19 @@ public sealed class LogUploadPipelineService : BackgroundService
             var upload = await ctx.LogUpload.FirstOrDefaultAsync(u => u.LogUploadId == uploadId, ct);
             if (upload == null)
             {
-                return;
+                return false;
             }
             upload.Status = "failed";
             upload.ErrorMessage = message[..Math.Min(message.Length, 2000)];
             upload.UpdatedAt = DateTime.UtcNow;
             ctx.LogUpload.Update(upload);
             await ctx.SaveChangesAsync(ct);
+            return upload.SourceType == "file";
         }
-        catch { /* best effort */ }
+        catch
+        {
+            return false;
+        }
     }
 
     private static async Task UpdateStatus(DatabaseContext ctx, LogUpload upload, string status, CancellationToken ct)
@@ -376,7 +620,13 @@ public sealed class LogUploadPipelineService : BackgroundService
         await ctx.SaveChangesAsync(ct);
     }
 
-    private async Task<long> SaveFightLogAsync(EliteInsightDataModel data, IPlayerService playerService, IPointsAwardService pointsAwardService, CancellationToken ct, long guildId = 0)
+    private async Task<long> SaveFightLogAsync(
+        EliteInsightDataModel data,
+        IPlayerService playerService,
+        IPointsAwardService pointsAwardService,
+        IRotationAnalysisService rotationAnalysisService,
+        CancellationToken ct,
+        long guildId = 0)
     {
         var fightPhase = FightLogMaterializer.ResolveFightPhase(data);
         var gw2Players = playerService.GetGw2Players(data, fightPhase, FightLogMaterializer.ShouldSumAllTargets(data));
@@ -388,6 +638,21 @@ public sealed class LogUploadPipelineService : BackgroundService
         }, ct);
 
         await pointsAwardService.AwardFightAsync(result.FightLogId, ct);
+        if (!data.FightEliteInsightDataModel.Wvw)
+        {
+            try
+            {
+                await rotationAnalysisService.AnalyzePlayerRotations(data);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    "Rotation analysis failed for fight {FightLogId} with exception type {ExceptionType}.",
+                    result.FightLogId,
+                    ex.GetType().Name);
+            }
+        }
+
         return result.FightLogId;
     }
 
@@ -411,6 +676,15 @@ public sealed class LogUploadPipelineService : BackgroundService
             }
         }
         catch { /* best effort */ }
+    }
+
+    private void CleanupUploadDirectories(long uploadId)
+    {
+        var storagePath = _configuration["Upload:StoragePath"] ?? "/tmp/donbot/uploads";
+        var outputPath = _configuration["EliteInsights:OutputBasePath"] ?? "/tmp/donbot/ei-output";
+        Cleanup(
+            Path.Combine(storagePath, uploadId.ToString(), "upload.zevtc"),
+            Path.Combine(outputPath, uploadId.ToString()));
     }
 
     private sealed class DpsReportUploadResult

@@ -28,10 +28,7 @@ public static class ApiServiceRegister
         });
 
         services.AddHttpClient();
-        services.AddHttpClient("gw2-api", c =>
-        {
-            c.Timeout = TimeSpan.FromSeconds(8);
-        });
+        services.AddHttpClient("gw2-api", c => { c.Timeout = TimeSpan.FromSeconds(8); });
 
         services.AddScoped(typeof(IDatabaseUpdateService<>), typeof(DatabaseUpdateService<>));
         services.AddScoped<IEntityService, EntityService>();
@@ -55,6 +52,11 @@ public static class ApiServiceRegister
         services.AddSingleton<RaffleService>();
         services.AddSingleton<LogUploadPipelineService>();
         services.AddSingleton<DiscordRestClientProvider>();
+        services.AddSingleton<IDiscordDeliveryGateway, DiscordDeliveryGateway>();
+        services.AddScoped<IDiscordUploadDeliveryService, DiscordUploadDeliveryService>();
+        services.AddScoped<IAggregateDiscordDeliveryService, AggregateDiscordDeliveryService>();
+        services.AddSingleton<IAggregateDeliveryAdmissionService, AggregateDeliveryAdmissionService>();
+        services.AddScoped<DiscordReportDeliveryClaimService>();
         services.AddSingleton<IDiscordGuildMembershipService, DiscordGuildMembershipService>();
         services.AddSingleton<IUserGuildsService, UserGuildsService>();
         services.AddSingleton<IDiscordCommandAccessService, DiscordCommandAccessService>();
@@ -65,7 +67,8 @@ public static class ApiServiceRegister
         services.AddHostedService(sp => sp.GetRequiredService<LogUploadPipelineService>());
 
         var jwtKey = configuration["DonBotJwtKey"] ?? Environment.GetEnvironmentVariable("DonBotJwtKey")
-            ?? throw new InvalidOperationException("'DonBotJwtKey' is not configured. Set it in appsettings.user.json or the .env file.");
+            ?? throw new InvalidOperationException(
+                "'DonBotJwtKey' is not configured. Set it in appsettings.user.json or the .env file.");
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer(options =>
@@ -108,17 +111,18 @@ public static class ApiServiceRegister
                 }
 
                 policy.AllowAnyHeader()
-                      .AllowAnyMethod()
-                      .AllowCredentials()
-                      .WithExposedHeaders(
-                          "X-Log-Upload-Id",
-                          "Upload-Offset",
-                          "Upload-Length",
-                          "Tus-Version",
-                          "Tus-Resumable",
-                          "Tus-Max-Size",
-                          "Location"
-                      );
+                    .AllowAnyMethod()
+                    .AllowCredentials()
+                    .WithExposedHeaders(
+                        "X-Log-Upload-Id",
+                        "Upload-Offset",
+                        "Upload-Length",
+                        "Tus-Version",
+                        "Tus-Resumable",
+                        "Tus-Max-Size",
+                        "Location",
+                        "X-DonBot-Discord-Delivery"
+                    );
             });
         });
     }

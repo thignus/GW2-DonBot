@@ -46,9 +46,6 @@ public class TableLayoutPreviewTests(ITestOutputHelper output)
         Preview("WvW Fight - Healing", WvWFightSummaryService.HealingColumns,
             ["01", "Renero.9172 (Dru)", "999.9K"]);
 
-        Preview("WvW Fight - Distance", WvWFightSummaryService.DistanceColumns,
-            ["01", "Monty.8103 (Spe)", "342.50"]);
-
         Preview("WvW Fight - Friendly/Stream", WvWFightSummaryService.FriendlyColumns,
             ["Ally", "60(45)", "12.4M", "210.5K", "85", "12"],
             ["Foe", "72", "9.8M", "166.1K", "120", "48"]);
@@ -64,6 +61,12 @@ public class TableLayoutPreviewTests(ITestOutputHelper output)
 
         Preview("Leaderboard - PvE Dmg Taken", WeeklyLeaderboardService.SimpleColumns("Avg Dmg Taken"),
             ["01", "(8) WalmsLo.8437", "4.3M"]);
+
+        Preview("Player Points - Latest Fight", PlayerPointRankingService.LatestFightColumns,
+            ["001", "SliferAlpha.9999", "+12.375"]);
+
+        Preview("Player Points - Total", PlayerPointRankingService.TotalPointsColumns,
+            ["001", "SliferAlpha.9999", "123,456"]);
 
         Preview("Know My Enemy", FightLogService.EnemyColumns,
             ["Spellbreaker", "8", "1.2M", "980.4K", "240.1K"],
